@@ -63,11 +63,30 @@ fn tile_pixel(map: &GameMap, pos: TilePos, lx: i32, ly: i32) -> Rgb {
                 color = if ly == 2 || lx == 1 { [0.55, 0.47, 0.30] } else { [0.78, 0.68, 0.46] };
             }
         }
-        Feature::HeavyCover => {
-            if (0..=7).contains(&lx) && (1..=6).contains(&ly) {
-                let edge = lx == 0 || lx == 7 || ly == 1 || ly == 6;
-                color = if edge { [0.30, 0.30, 0.33] } else { [0.50, 0.50, 0.54] };
-            }
+        Feature::Rock | Feature::Wall => {
+            let rock = tile.feature == Feature::Rock;
+            // Solid fill with a dark outline wherever the obstacle ends, so
+            // multi-tile outcrops and ruins read as one shape.
+            let same = |dx: i32, dy: i32| {
+                let n = pos.offset(dx, dy);
+                n.in_bounds() && map.tile(n).feature == tile.feature
+            };
+            let outline = (lx == 0 && !same(-1, 0))
+                || (lx == PX - 1 && !same(1, 0))
+                || (ly == 0 && !same(0, -1))
+                || (ly == PX - 1 && !same(0, 1));
+            color = if outline {
+                [0.14, 0.13, 0.13]
+            } else if rock {
+                // Speckled stone, lighter on top-left facets.
+                let n = ((pos.x * 31 + pos.y * 17 + lx * 7 + ly * 13) % 9) as f32 / 9.0;
+                let light = if lx + (PX - 1 - ly) < 6 { 0.08 } else { 0.0 };
+                [0.47 + n * 0.08 + light, 0.44 + n * 0.07 + light, 0.40 + n * 0.06 + light]
+            } else {
+                // Concrete blocks.
+                let seam = ly % 4 == 0 || (lx + if (ly / 4) % 2 == 0 { 0 } else { 4 }) % 8 == 0;
+                if seam { [0.36, 0.35, 0.37] } else { [0.58, 0.57, 0.60] }
+            };
         }
     }
 

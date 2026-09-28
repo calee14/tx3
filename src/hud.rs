@@ -5,7 +5,7 @@ use bevy::prelude::*;
 use crate::faction::LocalPlayer;
 use crate::fog::{FogDebug, FogOfWar};
 use crate::input::{CursorWorld, Selection};
-use crate::map::{self, GameMap, SECTOR_COUNT};
+use crate::map::{self, GameMap};
 use crate::sim::perception::Perception;
 use crate::sim::{SimTick, Unit};
 
@@ -50,7 +50,7 @@ fn update_hud(
 ) {
     let seconds = tick.0 as f64 / crate::sim::SIM_HZ;
     let mut lines = vec![
-        "TERMBOTS vs HUMANS  -  prototype step 1".to_string(),
+        format!("TERMBOTS vs HUMANS  -  prototype step 1   (you: {})", local.0.name()),
         format!(
             "Map seed {}   Time {:02}:{:02}{}",
             map.seed,
@@ -59,9 +59,8 @@ fn update_hud(
             if time.is_paused() { "   [PAUSED]" } else { "" }
         ),
         format!(
-            "Sectors revealed: {}/{}{}",
-            fog.revealed_count(local.0),
-            SECTOR_COUNT,
+            "Map explored: {:.0}%{}",
+            fog.explored_fraction(local.0) * 100.0,
             if fog_debug.show_all { "   (fog hidden: debug)" } else { "" }
         ),
     ];
@@ -70,12 +69,13 @@ fn update_hud(
         let t = map.tile(tile);
         let sector = &map.sectors[map::sector_index(tile)];
         let mut desc = format!(
-            "Tile ({}, {})  Sector {}  {}  {}",
+            "Tile ({}, {})  Sector {}  {}  {}  ({})",
             tile.x,
             tile.y,
             sector.name,
             map::elevation_name(t.elevation),
-            t.feature.name()
+            t.feature.name(),
+            if t.passable() { map.cover_at(tile).name() } else { "impassable" }
         );
         if t.ramp {
             desc.push_str("  Ramp");

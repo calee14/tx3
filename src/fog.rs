@@ -1,10 +1,14 @@
-//! The commander's fog of war, tracked per sector.
+//! The commander's fog of war, tracked per tile.
 //!
-//! - A sector is revealed for a side once any of its fighters sees into it.
-//! - Revealed sectors stay revealed permanently, including live enemy units.
-//! - Units in revealed sectors are shown plainly (no silhouettes).
+//! - Each side starts with the area around its own King revealed.
+//! - Fighters uncover the map as they move: any tile a fighter sees becomes
+//!   explored for its commander, permanently.
+//! - Enemy units on explored tiles are shown plainly (no silhouettes).
 //! - Hidden traps are NOT revealed by this; they need a fighter to detect
 //!   them directly (added with engineers in step 5).
+//!
+//! Fighters' own perception is separate (see `sim/perception.rs`): the fog
+//! never limits what units can see or react to.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::image::ImageSampler;
@@ -13,21 +17,23 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
 use crate::faction::{Faction, LocalPlayer};
 use crate::game::MatchEntity;
-use crate::map::{self, GameMap, MAP_H, MAP_W, SECTOR_COLS, SECTOR_COUNT, TILE_SIZE, TilePos};
+use crate::map::{GameMap, MAP_H, MAP_W, TILE_SIZE, TilePos};
 use crate::sim::perception::Perception;
 use crate::sim::{SimSet, Unit};
 
 pub const Z_FOG: f32 = 5.0;
-/// Opacity of unrevealed sectors. Terrain stays faintly visible: maps are
+/// Opacity of unexplored ground. Terrain stays faintly visible: maps are
 /// mirrored, so players can infer it from their own half anyway.
 const FOG_ALPHA: u8 = 248;
+/// Radius (in tiles) around each King that starts out explored.
+pub const START_REVEAL_RADIUS: f32 = 18.0;
 
 pub struct FogPlugin;
 
 impl Plugin for FogPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<FogDebug>()
-            .add_systems(FixedUpdate, reveal_sectors.in_set(SimSet::Intel))
+            .add_systems(FixedUpdate, reveal_tiles.in_set(SimSet::Intel))
             .add_systems(
                 Update,
                 (update_fog_overlay, update_enemy_visibility).run_if(resource_exists::<FogOfWar>),
@@ -35,43 +41,47 @@ impl Plugin for FogPlugin {
     }
 }
 
-/// Per-faction list of revealed sectors.
+fn tile_index(pos: TilePos) -> usize {
+    (pos.y * MAP_W + pos.x) as usize
+}
+
+/// Which tiles each side's commander has explored.
 #[derive(Resource, Debug)]
 pub struct FogOfWar {
-    revealed: [[bool; SECTOR_COUNT]; 2],
+    explored: [Vec<bool>; 2],
 }
 
 impl FogOfWar {
-    /// Opening reveal: each side knows its own half of the map, plus the
-    /// enemy's center-forward sector, so both see a little of what they face.
-    pub fn with_opening_reveal() -> Self {
-        let mut fog = Self { revealed: [[false; SECTOR_COUNT]; 2] };
-        let home_rows = map::SECTOR_ROWS / 2;
-        for id in 0..home_rows * SECTOR_COLS {
-            fog.revealed[Faction::Humans.index()][id] = true;
-            fog.revealed[Faction::Termbots.index()][map::mirrored_sector(id)] = true;
+    /// Opening state: a circle around each side's own King.
+    pub fn new(map: &GameMap) -> Self {
+        let tiles = (MAP_W * MAP_H) as usize;
+        let mut fog = Self { explored: [vec![false; tiles], vec![false; tiles]] };
+        for faction in Faction::ALL {
+            let spawn = map.spawn(faction);
+            for y in 0..MAP_H {
+                for x in 0..MAP_W {
+                    let p = TilePos::new(x, y);
+                    if p.distance(spawn) <= START_REVEAL_RADIUS {
+                        fog.explored[faction.index()][tile_index(p)] = true;
+                    }
+                }
+            }
         }
-        // Enemy center sector in the row just across the middle line.
-        let enemy_center_forward = home_rows * SECTOR_COLS + SECTOR_COLS / 2;
-        fog.revealed[Faction::Humans.index()][enemy_center_forward] = true;
-        fog.revealed[Faction::Termbots.index()][map::mirrored_sector(enemy_center_forward)] = true;
         fog
     }
 
-    pub fn is_revealed(&self, faction: Faction, sector: usize) -> bool {
-        self.revealed[faction.index()][sector]
+    pub fn is_explored(&self, faction: Faction, pos: TilePos) -> bool {
+        self.explored[faction.index()][tile_index(pos)]
     }
 
-    pub fn is_tile_revealed(&self, faction: Faction, pos: TilePos) -> bool {
-        self.is_revealed(faction, map::sector_index(pos))
-    }
-
-    pub fn revealed_count(&self, faction: Faction) -> usize {
-        self.revealed[faction.index()].iter().filter(|&&r| r).count()
+    /// Fraction of the map this side has explored, 0 to 1.
+    pub fn explored_fraction(&self, faction: Faction) -> f32 {
+        let tiles = &self.explored[faction.index()];
+        tiles.iter().filter(|&&e| e).count() as f32 / tiles.len() as f32
     }
 }
 
-/// Debug toggle (F key): show the whole map as if every sector were revealed.
+/// Debug toggle (F key): show the whole map as if it were all explored.
 #[derive(Resource, Default)]
 pub struct FogDebug {
     pub show_all: bool,
@@ -80,19 +90,18 @@ pub struct FogDebug {
 #[derive(Resource)]
 pub struct FogOverlay(Handle<Image>);
 
-/// Fighters' perception reveals sectors for their commander.
-fn reveal_sectors(mut fog: ResMut<FogOfWar>, viewers: Query<(&Faction, &Perception), Changed<Perception>>) {
+/// Whatever fighters see becomes explored for their commander.
+fn reveal_tiles(mut fog: ResMut<FogOfWar>, viewers: Query<(&Faction, &Perception), Changed<Perception>>) {
     let mut changed = false;
-    // Write without triggering change detection unless a new sector opens.
+    // Write without triggering change detection unless new ground opens up.
     let fog_data = fog.bypass_change_detection();
     for (faction, perception) in &viewers {
+        let explored = &mut fog_data.explored[faction.index()];
         for &tile in &perception.visible_tiles {
-            let sector = map::sector_index(tile);
-            let slot = &mut fog_data.revealed[faction.index()][sector];
+            let slot = &mut explored[tile_index(tile)];
             if !*slot {
                 *slot = true;
                 changed = true;
-                info!("{} revealed sector {}", faction.name(), sector_name(sector));
             }
         }
     }
@@ -101,13 +110,8 @@ fn reveal_sectors(mut fog: ResMut<FogOfWar>, viewers: Query<(&Faction, &Percepti
     }
 }
 
-fn sector_name(id: usize) -> String {
-    let col = id % SECTOR_COLS;
-    let row = id / SECTOR_COLS;
-    format!("{}{}", (b'A' + col as u8) as char, row + 1)
-}
-
-/// Spawn the dark overlay sprite: one texture pixel per tile.
+/// Spawn the dark overlay sprite: one texture pixel per tile, sampled with
+/// linear filtering so the fog has soft edges.
 pub fn spawn_fog_overlay(commands: &mut Commands, images: &mut Assets<Image>) {
     let mut image = Image::new(
         Extent3d { width: MAP_W as u32, height: MAP_H as u32, depth_or_array_layers: 1 },
@@ -116,7 +120,7 @@ pub fn spawn_fog_overlay(commands: &mut Commands, images: &mut Assets<Image>) {
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
     );
-    image.sampler = ImageSampler::nearest();
+    image.sampler = ImageSampler::linear();
     let handle = images.add(image);
     commands.insert_resource(FogOverlay(handle.clone()));
     commands.spawn((
@@ -145,26 +149,22 @@ fn update_fog_overlay(
     let Some(data) = image.data.as_mut() else { return };
     for y in 0..MAP_H {
         for x in 0..MAP_W {
-            let hidden = !debug.show_all && !fog.is_tile_revealed(local.0, TilePos::new(x, y));
+            let hidden = !debug.show_all && !fog.is_explored(local.0, TilePos::new(x, y));
             let i = (((MAP_H - 1 - y) * MAP_W + x) * 4) as usize;
             data[i..i + 4].copy_from_slice(&[4, 5, 9, if hidden { FOG_ALPHA } else { 0 }]);
         }
     }
 }
 
-/// Enemy units are shown only in sectors the local commander has revealed.
+/// Enemy units are shown only on ground the local commander has explored.
 fn update_enemy_visibility(
     fog: Res<FogOfWar>,
     debug: Res<FogDebug>,
     local: Res<LocalPlayer>,
-    map: Option<Res<GameMap>>,
     mut units: Query<(&Faction, &TilePos, &mut Visibility), With<Unit>>,
 ) {
-    if map.is_none() {
-        return;
-    }
     for (faction, pos, mut visibility) in &mut units {
-        let shown = *faction == local.0 || debug.show_all || fog.is_tile_revealed(local.0, *pos);
+        let shown = *faction == local.0 || debug.show_all || fog.is_explored(local.0, *pos);
         visibility.set_if_neq(if shown { Visibility::Inherited } else { Visibility::Hidden });
     }
 }

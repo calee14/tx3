@@ -61,7 +61,7 @@ pub fn start_match(commands: &mut Commands, images: &mut Assets<Image>, seed: u6
     commands.insert_resource(SimRng(ChaCha8Rng::seed_from_u64(map.seed ^ 0x5EED_0F_BA77_1E)));
     commands.insert_resource(SimTick::default());
     commands.insert_resource(CommandQueue::default());
-    commands.insert_resource(FogOfWar::with_opening_reveal());
+    commands.insert_resource(FogOfWar::new(&map));
     commands.insert_resource(Selection::default());
     commands.insert_resource(index);
     commands.insert_resource(map);

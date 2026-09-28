@@ -87,10 +87,15 @@ pub enum Feature {
     None,
     /// Concealment and light cover; slows movement.
     Trees,
-    /// Sandbags, debris. Reduces damage; destroyed by Explosive.
+    /// Sandbags, craters, debris. Walkable; light cover for whoever
+    /// stands in it. Destroyed by Explosive.
     LightCover,
-    /// Walls, rocks. Strong protection; Tanks and Explosive can break it.
-    HeavyCover,
+    /// Rock outcrop. Solid: blocks movement and sight. Units next to it
+    /// get heavy cover.
+    Rock,
+    /// Ruined building wall or concrete barrier. Solid like rock; Tanks and
+    /// Explosive will be able to break it (later).
+    Wall,
 }
 
 impl Feature {
@@ -98,8 +103,32 @@ impl Feature {
         match self {
             Feature::None => "Open ground",
             Feature::Trees => "Trees",
-            Feature::LightCover => "Light cover",
-            Feature::HeavyCover => "Heavy cover",
+            Feature::LightCover => "Sandbags",
+            Feature::Rock => "Rock",
+            Feature::Wall => "Wall",
+        }
+    }
+
+    /// Solid obstacles can't be walked through and block line of sight.
+    pub fn is_solid(self) -> bool {
+        matches!(self, Feature::Rock | Feature::Wall)
+    }
+}
+
+/// How protected a unit standing on a tile is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CoverLevel {
+    None,
+    Light,
+    Heavy,
+}
+
+impl CoverLevel {
+    pub fn name(self) -> &'static str {
+        match self {
+            CoverLevel::None => "No cover",
+            CoverLevel::Light => "Light cover",
+            CoverLevel::Heavy => "Heavy cover",
         }
     }
 }
@@ -116,12 +145,17 @@ pub struct Tile {
 
 impl Tile {
     /// Movement cost multiplier for entering this tile (1 = open ground).
+    /// Not meaningful for solid tiles, which can't be entered at all.
     pub fn move_cost(self) -> u32 {
         match self.feature {
             Feature::None => 1,
             Feature::Trees | Feature::LightCover => 2,
-            Feature::HeavyCover => 3,
+            Feature::Rock | Feature::Wall => u32::MAX / 64,
         }
+    }
+
+    pub fn passable(self) -> bool {
+        !self.feature.is_solid()
     }
 }
 
@@ -134,7 +168,7 @@ pub fn elevation_name(elevation: u8) -> &'static str {
 }
 
 /// One territory zone. Territory control over sectors decides the match
-/// when time runs out, and the commander's fog is tracked per sector.
+/// when time runs out.
 #[derive(Clone, Debug)]
 #[allow(dead_code)] // `id` and `home_of` are used by territory control (step 4)
 pub struct Sector {
@@ -167,6 +201,7 @@ pub fn sector_index(pos: TilePos) -> usize {
 }
 
 /// The sector on the other side of the map that mirrors this one.
+#[allow(dead_code)] // used by tests now, territory control later
 pub fn mirrored_sector(id: usize) -> usize {
     SECTOR_COUNT - 1 - id
 }
@@ -220,11 +255,12 @@ impl GameMap {
 
     /// Can a unit step directly from `a` to the neighboring tile `b`?
     ///
+    /// - Never into a solid obstacle (rock, wall).
     /// - Same elevation: always.
     /// - One level apart (orthogonal steps only): only if the higher tile
     ///   is a ramp.
     /// - Diagonal steps: only across flat ground, and never cutting a
-    ///   corner past a ledge.
+    ///   corner past a ledge or an obstacle.
     pub fn can_step(&self, a: TilePos, b: TilePos) -> bool {
         if !b.in_bounds() || !a.in_bounds() {
             return false;
@@ -236,13 +272,19 @@ impl GameMap {
         }
         let ta = self.tile(a);
         let tb = self.tile(b);
+        if !ta.passable() || !tb.passable() {
+            return false;
+        }
         if dx != 0 && dy != 0 {
-            // Diagonal: all four tiles involved must be on the same level.
+            // Diagonal: all four tiles involved must be on the same level,
+            // and the two corner tiles must be open.
             let c1 = self.tile(TilePos::new(a.x + dx, a.y));
             let c2 = self.tile(TilePos::new(a.x, a.y + dy));
             return ta.elevation == tb.elevation
                 && c1.elevation == ta.elevation
-                && c2.elevation == ta.elevation;
+                && c2.elevation == ta.elevation
+                && c1.passable()
+                && c2.passable();
         }
         match ta.elevation.abs_diff(tb.elevation) {
             0 => true,
@@ -254,6 +296,22 @@ impl GameMap {
                 }
             }
             _ => false,
+        }
+    }
+
+    /// Protection for a unit standing on `pos`: heavy next to a rock or
+    /// wall, light in sandbags or trees.
+    pub fn cover_at(&self, pos: TilePos) -> CoverLevel {
+        let beside_obstacle = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+            .into_iter()
+            .map(|(dx, dy)| pos.offset(dx, dy))
+            .any(|n| n.in_bounds() && self.tile(n).feature.is_solid());
+        if beside_obstacle {
+            return CoverLevel::Heavy;
+        }
+        match self.tile(pos).feature {
+            Feature::LightCover | Feature::Trees => CoverLevel::Light,
+            _ => CoverLevel::None,
         }
     }
 

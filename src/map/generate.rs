@@ -12,7 +12,8 @@
 //! 3. Ramps scattered along ledges.
 //! 4. Connectivity fix: extra ramps until every tile is reachable.
 //! 5. Forests from noise + cellular automata.
-//! 6. Cover clusters, biased toward sector borders (likely fighting lines).
+//! 6. Obstacles: ruined buildings, rock outcrops, barrier walls, boulders
+//!    and sandbags. Solid ones are only kept if the map stays connected.
 //! 7. Validation. If a check fails, reroll with the next seed.
 
 use rand::seq::SliceRandom;
@@ -66,7 +67,7 @@ pub fn try_generate(seed: u64) -> Result<GameMap, GenError> {
     place_ramps(&mut map, &mut rng);
     fix_connectivity(&mut map)?;
     place_trees(&mut map, &mut rng);
-    place_cover(&mut map, &mut rng);
+    place_obstacles(&mut map, &mut rng);
     validate(&map)?;
     Ok(map)
 }
@@ -269,55 +270,197 @@ fn place_trees(map: &mut GameMap, rng: &mut ChaCha8Rng) {
     }
 }
 
-fn place_cover(map: &mut GameMap, rng: &mut ChaCha8Rng) {
-    const TARGET_CLUSTERS: usize = 36;
-    const MAX_TRIES: usize = 2000;
-    let mut placed = 0;
+/// Is every walkable tile reachable from the Humans' spawn?
+fn fully_connected(map: &GameMap) -> bool {
+    let reach = reachable_from(map, map.spawns[0]);
+    all_tiles().all(|p| reach[idx(p)] || !map.tile(p).passable())
+}
 
-    for _ in 0..MAX_TRIES {
-        if placed >= TARGET_CLUSTERS {
+/// Can an obstacle go on this tile? Keeps bases, ramps and the tiles next
+/// to ramps clear, and only uses the Humans' half (it's mirrored after).
+fn obstacle_ok(map: &GameMap, p: TilePos) -> bool {
+    p.in_bounds()
+        && in_generated_half(p)
+        && !near_spawn(map, p, BASE_FLAT_RADIUS + 1.0)
+        && !map.tile(p).ramp
+        && neighbors8(p).all(|n| !map.tile(n).ramp)
+}
+
+/// Apply features to a set of tiles and their mirrors, then keep the
+/// change only if the map is still fully connected.
+fn try_place(map: &mut GameMap, changes: &[(TilePos, Feature)]) -> bool {
+    if changes.is_empty() {
+        return false;
+    }
+    let backup: Vec<(TilePos, Tile)> = changes
+        .iter()
+        .flat_map(|&(p, _)| [(p, map.tile(p)), (p.mirrored(), map.tile(p.mirrored()))])
+        .collect();
+    for &(p, feature) in changes {
+        map.tile_mut(p).feature = feature;
+        map.tile_mut(p.mirrored()).feature = feature;
+    }
+    let blocks_any = changes.iter().any(|(_, f)| f.is_solid());
+    if blocks_any && !fully_connected(map) {
+        for (p, tile) in backup.into_iter().rev() {
+            *map.tile_mut(p) = tile;
+        }
+        return false;
+    }
+    true
+}
+
+fn random_tile_in_half(rng: &mut ChaCha8Rng) -> TilePos {
+    TilePos::new(rng.random_range(0..MAP_W), rng.random_range(0..MAP_H / 2))
+}
+
+/// A random tile near a sector border (where fighting lines form), on the
+/// Humans' half.
+fn random_tile_near_border(rng: &mut ChaCha8Rng) -> TilePos {
+    let jitter = rng.random_range(-4..=4);
+    if rng.random_bool(0.5) {
+        let x = [SECTOR_COL_EDGES[1], SECTOR_COL_EDGES[2]][rng.random_range(0..2)] + jitter;
+        TilePos::new(x, rng.random_range(0..MAP_H / 2))
+    } else {
+        let y = [SECTOR_ROW_EDGES[1], SECTOR_ROW_EDGES[2] - 5][rng.random_range(0..2)] + jitter;
+        TilePos::new(rng.random_range(0..MAP_W), y)
+    }
+}
+
+/// Large solid obstacles that fighters maneuver around and take cover
+/// behind, plus walkable sandbag lines. Counts are per half of the map.
+fn place_obstacles(map: &mut GameMap, rng: &mut ChaCha8Rng) {
+    place_repeatedly(map, rng, 7, place_ruin);
+    place_repeatedly(map, rng, 12, place_rock_outcrop);
+    place_repeatedly(map, rng, 12, place_barrier);
+    place_repeatedly(map, rng, 16, place_boulder);
+    place_repeatedly(map, rng, 24, place_sandbags);
+}
+
+fn place_repeatedly(
+    map: &mut GameMap,
+    rng: &mut ChaCha8Rng,
+    target: usize,
+    place: fn(&mut GameMap, &mut ChaCha8Rng) -> bool,
+) {
+    let mut placed = 0;
+    for _ in 0..target * 30 {
+        if placed >= target {
             break;
         }
-        // Half the clusters hug a sector border, where fights will happen.
-        let start = if rng.random_bool(0.5) {
-            let jitter = rng.random_range(-3..=3);
-            if rng.random_bool(0.5) {
-                let x = [SECTOR_COL_EDGES[1], SECTOR_COL_EDGES[2]][rng.random_range(0..2)] + jitter;
-                TilePos::new(x, rng.random_range(0..MAP_H / 2))
-            } else {
-                let y = [SECTOR_ROW_EDGES[1], SECTOR_ROW_EDGES[2] - 3][rng.random_range(0..2)] + jitter;
-                TilePos::new(rng.random_range(0..MAP_W), y)
-            }
-        } else {
-            TilePos::new(rng.random_range(0..MAP_W), rng.random_range(0..MAP_H / 2))
-        };
-
-        let horizontal = rng.random_bool(0.5);
-        let len = rng.random_range(2..=4);
-        let kind = if rng.random_bool(0.3) { Feature::HeavyCover } else { Feature::LightCover };
-        let cluster: Vec<TilePos> = (0..len)
-            .map(|i| if horizontal { start.offset(i, 0) } else { start.offset(0, i) })
-            .collect();
-
-        let elevation = if start.in_bounds() { map.tile(start).elevation } else { 0 };
-        let fits = cluster.iter().all(|&p| {
-            p.in_bounds()
-                && in_generated_half(p)
-                && !near_spawn(map, p, 8.0)
-                && map.tile(p).feature == Feature::None
-                && map.tile(p).elevation == elevation
-                && !map.tile(p).ramp
-                && neighbors4(p).all(|n| !map.tile(n).ramp)
-        });
-        if !fits {
-            continue;
+        if place(map, rng) {
+            placed += 1;
         }
-        for p in cluster {
-            map.tile_mut(p).feature = kind;
-            map.tile_mut(p.mirrored()).feature = kind;
-        }
-        placed += 1;
     }
+}
+
+/// A ruined building: rectangular walls with two doorways and some
+/// collapsed sections, rubble inside. Great cover for a platoon.
+fn place_ruin(map: &mut GameMap, rng: &mut ChaCha8Rng) -> bool {
+    let w = rng.random_range(6..=10);
+    let h = rng.random_range(5..=8);
+    let origin = random_tile_in_half(rng);
+    let footprint: Vec<TilePos> = (0..h).flat_map(|y| (0..w).map(move |x| origin.offset(x, y))).collect();
+    if !footprint.iter().all(|&p| obstacle_ok(map, p)) {
+        return false;
+    }
+    let elevation = map.tile(origin).elevation;
+    if footprint.iter().any(|&p| map.tile(p).elevation != elevation) {
+        return false;
+    }
+
+    // Two doorways (2 tiles wide) on two different sides.
+    let mut sides = [0, 1, 2, 3];
+    sides.shuffle(rng);
+    let mut doors: Vec<TilePos> = Vec::new();
+    for &side in &sides[..2] {
+        let (len, at): (i32, Box<dyn Fn(i32) -> TilePos>) = match side {
+            0 => (w, Box::new(move |i| origin.offset(i, 0))),
+            1 => (w, Box::new(move |i| origin.offset(i, h - 1))),
+            2 => (h, Box::new(move |i| origin.offset(0, i))),
+            _ => (h, Box::new(move |i| origin.offset(w - 1, i))),
+        };
+        let i = rng.random_range(1..len - 2);
+        doors.push(at(i));
+        doors.push(at(i + 1));
+    }
+
+    let mut changes = Vec::new();
+    for &p in &footprint {
+        let edge = p.x == origin.x || p.y == origin.y || p.x == origin.x + w - 1 || p.y == origin.y + h - 1;
+        let feature = if edge {
+            if doors.contains(&p) || rng.random_bool(0.12) { Feature::None } else { Feature::Wall }
+        } else if rng.random_bool(0.1) {
+            Feature::LightCover // rubble
+        } else {
+            Feature::None
+        };
+        changes.push((p, feature));
+    }
+    try_place(map, &changes)
+}
+
+/// A rough blob of rock, 3 to 10 tiles across.
+fn place_rock_outcrop(map: &mut GameMap, rng: &mut ChaCha8Rng) -> bool {
+    let center = random_tile_in_half(rng);
+    let radius: f32 = rng.random_range(1.8..4.8);
+    let r = radius.ceil() as i32 + 1;
+    let mut changes = Vec::new();
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let p = center.offset(dx, dy);
+            let jitter: f32 = rng.random_range(-0.7..0.7);
+            if center.distance(p) <= radius + jitter && obstacle_ok(map, p) {
+                changes.push((p, Feature::Rock));
+            }
+        }
+    }
+    changes.len() >= 4 && try_place(map, &changes)
+}
+
+/// A single 1-2 tile boulder: scattered cover in open ground.
+fn place_boulder(map: &mut GameMap, rng: &mut ChaCha8Rng) -> bool {
+    let p = random_tile_in_half(rng);
+    let mut changes = vec![(p, Feature::Rock)];
+    if rng.random_bool(0.5) {
+        changes.push((p.offset(1, 0), Feature::Rock));
+    }
+    changes.iter().all(|&(t, _)| obstacle_ok(map, t) && map.tile(t).feature == Feature::None)
+        && try_place(map, &changes)
+}
+
+/// A straight concrete barrier wall, biased toward sector borders.
+fn place_barrier(map: &mut GameMap, rng: &mut ChaCha8Rng) -> bool {
+    let start = random_tile_near_border(rng);
+    let len = rng.random_range(3..=6);
+    let horizontal = rng.random_bool(0.5);
+    let changes: Vec<(TilePos, Feature)> = (0..len)
+        .map(|i| (if horizontal { start.offset(i, 0) } else { start.offset(0, i) }, Feature::Wall))
+        .collect();
+    let fits = changes.iter().all(|&(p, _)| {
+        obstacle_ok(map, p)
+            && map.tile(p).feature == Feature::None
+            && map.tile(p).elevation == map.tile(start).elevation
+    });
+    fits && try_place(map, &changes)
+}
+
+/// A short walkable line of sandbags (light cover).
+fn place_sandbags(map: &mut GameMap, rng: &mut ChaCha8Rng) -> bool {
+    let start = if rng.random_bool(0.5) { random_tile_near_border(rng) } else { random_tile_in_half(rng) };
+    let len = rng.random_range(2..=4);
+    let horizontal = rng.random_bool(0.5);
+    let changes: Vec<(TilePos, Feature)> = (0..len)
+        .map(|i| (if horizontal { start.offset(i, 0) } else { start.offset(0, i) }, Feature::LightCover))
+        .collect();
+    let fits = changes.iter().all(|&(p, _)| {
+        p.in_bounds()
+            && in_generated_half(p)
+            && !near_spawn(map, p, 8.0)
+            && map.tile(p).feature == Feature::None
+            && !map.tile(p).ramp
+    });
+    fits && try_place(map, &changes)
 }
 
 pub fn validate(map: &GameMap) -> Result<(), GenError> {
@@ -328,7 +471,7 @@ pub fn validate(map: &GameMap) -> Result<(), GenError> {
     }
 
     let reach = reachable_from(map, map.spawns[0]);
-    if let Some(p) = all_tiles().find(|&p| !reach[idx(p)]) {
+    if let Some(p) = all_tiles().find(|&p| !reach[idx(p)] && map.tile(p).passable()) {
         return Err(GenError::Unreachable(p));
     }
 
@@ -381,8 +524,9 @@ mod tests {
         assert!(count(&|t| t.elevation == 2) > 300, "needs high ground");
         assert!(count(&|t| t.ramp) > 10, "needs ramps");
         assert!(count(&|t| t.feature == Feature::Trees) > 500, "needs forests");
-        assert!(count(&|t| t.feature == Feature::HeavyCover) > 4, "needs heavy cover");
-        assert!(count(&|t| t.feature == Feature::LightCover) > 10, "needs light cover");
+        assert!(count(&|t| t.feature == Feature::Rock) > 150, "needs rock outcrops");
+        assert!(count(&|t| t.feature == Feature::Wall) > 150, "needs ruins and barriers");
+        assert!(count(&|t| t.feature == Feature::LightCover) > 60, "needs sandbags");
     }
 
     #[test]

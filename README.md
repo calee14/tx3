@@ -38,13 +38,14 @@ Run the tests with `cargo test`.
 | Mouse wheel | Zoom |
 | Space | Pause / resume (single-player only). Orders given while paused apply on resume |
 | F | Debug: toggle fog of war off to see the whole map |
+| Hover a tile | The HUD shows its terrain and how much cover it gives |
 | N | Debug: generate a new map (next seed) |
 
 ## What's in step 1
 
-- **Mirrored procedural maps.** 128×128 tiles, symmetric under a 180° rotation so both sides get identical terrain. Three elevation levels with ledges and ramps, forests, and light and heavy cover placed near sector borders. Every map is validated: every tile is reachable, and no high ground overlooks a spawn. A seed that fails validation is rerolled.
-- **12 sectors** (A1–C4). Rows 1–2 are the Humans' half and rows 3–4 are the Termbots'.
-- **Two layers of knowledge.** Each unit has its own vision: radius-based, extended by high ground, blocked by higher ledges and forest depth. The commander's fog is per sector. A sector is revealed permanently once any of your units sees into it. Enemy units show up only in revealed sectors. Opening reveal: your own half plus the enemy's center-forward sector (B3 for Humans).
+- **Mirrored procedural maps.** 128×128 tiles, symmetric under a 180° rotation so both sides get identical terrain. The terrain has three elevation levels with ledges and ramps, and forests. Obstacles include ruined buildings with doorways, rock outcrops, concrete barrier walls, boulders and sandbag lines. Rocks and walls are solid: they block movement and sight, and a unit standing next to one gets heavy cover. Sandbags and trees give light cover. Every map is validated: every walkable tile is reachable, and no high ground overlooks a spawn. A seed that fails validation is rerolled.
+- **12 sectors** (A1–C4), used for territory control. Rows 1–2 are the Humans' half and rows 3–4 are the Termbots'.
+- **Two layers of knowledge.** Each unit has its own vision: radius-based, extended by high ground, blocked by higher ledges, rocks, walls and forest depth. The commander's fog is per tile. Each side starts with a circle around its King revealed, and every tile a unit sees stays explored. Enemy units show up only on explored ground.
 - **Simulation architecture built for multiplayer.** Game logic runs in `FixedUpdate` at 20 ticks per second. Every change goes through a `CommandQueue` of `SimCommand`s, addressed by stable `UnitId`s. Randomness comes from a seeded `SimRng`. Rendering interpolates between ticks, so tile-to-tile movement looks smooth.
 
 ## Project layout

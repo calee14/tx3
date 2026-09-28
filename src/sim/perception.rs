@@ -50,6 +50,11 @@ pub fn line_of_sight(map: &GameMap, from: TilePos, to: TilePos) -> bool {
         if tile.elevation > viewer_elevation {
             blocked = true;
         }
+        // Rocks and walls block sight, unless you look down on them from
+        // higher ground.
+        if tile.feature.is_solid() && tile.elevation >= viewer_elevation {
+            blocked = true;
+        }
         if tile.feature == Feature::Trees {
             trees += 1;
             if trees >= FOREST_SIGHT_DEPTH {
@@ -157,6 +162,17 @@ mod tests {
         let mut map = flat_map();
         map.tile_mut(TilePos::new(10, 10)).elevation = 1;
         map.tile_mut(TilePos::new(12, 10)).elevation = 1;
+        assert!(line_of_sight(&map, TilePos::new(10, 10), TilePos::new(15, 10)));
+    }
+
+    #[test]
+    fn obstacles_block_sight_except_from_above() {
+        let mut map = flat_map();
+        map.tile_mut(TilePos::new(12, 10)).feature = Feature::Rock;
+        assert!(line_of_sight(&map, TilePos::new(10, 10), TilePos::new(12, 10)));
+        assert!(!line_of_sight(&map, TilePos::new(10, 10), TilePos::new(15, 10)));
+        map.tile_mut(TilePos::new(10, 10)).elevation = 1;
+        map.tile_mut(TilePos::new(11, 10)).elevation = 1;
         assert!(line_of_sight(&map, TilePos::new(10, 10), TilePos::new(15, 10)));
     }
 
