@@ -71,7 +71,8 @@ pub fn setup_simulation(commands: &mut Commands, seed: u64) -> crate::map::GameM
     commands.insert_resource(Supply::default());
     commands.insert_resource(SetupLog::default());
     commands.insert_resource(Territory::new(&map));
-    commands.insert_resource(crate::commander::CommanderState::default());
+    // The AI commands the side the local player isn't on.
+    commands.insert_resource(crate::termbot::AiCommanders::new(&[Faction::Termbots]));
     commands.insert_resource(SimRng(rng));
     commands.insert_resource(MatchOutcome::default());
     commands.insert_resource(SimTick::default());
@@ -111,7 +112,7 @@ mod tests {
     /// ready (the battle starts on the first tick).
     fn headless_app(seed: u64) -> App {
         let mut app = App::new();
-        app.add_plugins((SimPlugin, crate::fog::FogPlugin, crate::commander::CommanderPlugin));
+        app.add_plugins((SimPlugin, crate::fog::FogPlugin, crate::termbot::TermbotPlugin));
         let world = app.world_mut();
         let map = {
             let mut queue = bevy::ecs::world::CommandQueue::default();
@@ -127,6 +128,119 @@ mod tests {
         }
         queue.push(crate::sim::SimCommand::Ready { issuer: Faction::Humans });
         app
+    }
+
+    /// A headless match where the AI commands both sides.
+    fn headless_ai_vs_ai(seed: u64) -> App {
+        let mut app = App::new();
+        app.add_plugins((SimPlugin, crate::fog::FogPlugin, crate::termbot::TermbotPlugin));
+        let world = app.world_mut();
+        let map = {
+            let mut queue = bevy::ecs::world::CommandQueue::default();
+            let mut commands = Commands::new(&mut queue, world);
+            let map = setup_simulation(&mut commands, seed);
+            queue.apply(world);
+            map
+        };
+        world.insert_resource(map);
+        world.insert_resource(crate::termbot::AiCommanders::new(&[Faction::Humans, Faction::Termbots]));
+        app
+    }
+
+    fn side_summary(app: &mut App) -> String {
+        use crate::sim::fighter::Fighter;
+        let world = app.world_mut();
+        let mut fighters = [0; 2];
+        for (f, _) in world.query::<(&Faction, &Fighter)>().iter(world) {
+            fighters[f.index()] += 1;
+        }
+        let t = world.resource::<crate::sim::economy::Territory>();
+        let (h, tb) = (t.held(Faction::Humans), t.held(Faction::Termbots));
+        let o = world.resource::<crate::sim::combat::MatchOutcome>();
+        format!(
+            "fighters H {} / T {}   sectors H {h} / T {tb}   {}",
+            fighters[0],
+            fighters[1],
+            if o.ended { format!("ENDED: {:?} ({})", o.winner, o.reason) } else { String::new() }
+        )
+    }
+
+    /// Watch the AI think. `AI_VS_AI=1 SEED=42 MINS=5 cargo test ai_report -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn ai_report() {
+        let seed = std::env::var("SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(42);
+        let mins: u32 = std::env::var("MINS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+        let mut app = if std::env::var("AI_VS_AI").is_ok() { headless_ai_vs_ai(seed) } else { headless_app(seed) };
+        let mut printed: std::collections::HashMap<Faction, usize> = Default::default();
+        for step in 0..mins * 6 {
+            run_ticks(&mut app, 200);
+            let ais = app.world().resource::<crate::termbot::AiCommanders>();
+            for b in &ais.brains {
+                let seen = printed.entry(b.faction).or_default();
+                // Print only new lines (log keeps the last 8).
+                let total = b.log.len();
+                for line in b.log.iter().skip(total.saturating_sub(8)) {
+                    let key = line.clone();
+                    let _ = key;
+                }
+                let _ = seen;
+                for line in &b.log {
+                    eprintln!("  [{:?} {}] {line}", b.faction, b.style.name());
+                }
+            }
+            eprintln!("-- t={}s {}", (step + 1) * 10, side_summary(&mut app));
+            let world = app.world_mut();
+            world.resource_mut::<crate::termbot::AiCommanders>().brains.iter_mut().for_each(|b| b.log.clear());
+            if world.resource::<crate::sim::combat::MatchOutcome>().ended {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn ai_only_knows_what_its_side_has_seen() {
+        let mut app = headless_ai_vs_ai(42);
+        for _ in 0..60 {
+            run_ticks(&mut app, 60);
+            let world = app.world();
+            let fog = world.resource::<crate::fog::FogOfWar>();
+            for brain in &world.resource::<crate::termbot::AiCommanders>().brains {
+                for pos in brain.known_enemy_positions() {
+                    assert!(fog.is_explored(brain.faction, pos), "{:?} knows about a unit at {pos:?} it can't see", brain.faction);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ai_does_not_confuse_its_own_platoons() {
+        use crate::sim::platoon::{CONFUSION_FREEZE, Platoon};
+        let mut app = headless_ai_vs_ai(7);
+        let (mut worst, mut total, mut samples) = (0.0f32, 0.0f32, 0u32);
+        for _ in 0..120 {
+            run_ticks(&mut app, 40);
+            let world = app.world_mut();
+            for p in world.query::<&Platoon>().iter(world) {
+                worst = worst.max(p.confusion);
+                total += p.confusion;
+                samples += 1;
+            }
+        }
+        assert!(worst < CONFUSION_FREEZE, "a platoon froze from AI signals (confusion {worst:.0})");
+        let average = total / samples as f32;
+        assert!(average < 20.0, "average confusion too high: {average:.1}");
+    }
+
+    #[test]
+    fn ai_vs_ai_is_deterministic_and_fights() {
+        let mut a = headless_ai_vs_ai(5);
+        let mut b = headless_ai_vs_ai(5);
+        let shots_a = run_ticks(&mut a, 150 * 20);
+        let shots_b = run_ticks(&mut b, 150 * 20);
+        assert!(shots_a > 20, "the commanders should find each other ({shots_a} shots)");
+        assert_eq!(shots_a, shots_b);
+        assert_eq!(side_summary(&mut a), side_summary(&mut b));
     }
 
     /// Run ticks, returning the number of shots fired.
@@ -163,10 +277,14 @@ mod tests {
         run_ticks(&mut app, 2);
         let world = app.world_mut();
         assert!(world.resource::<MatchPhase>().battle);
-        let platoons = world.query::<&crate::sim::platoon::Platoon>().iter(world).count();
-        assert_eq!(platoons, 6);
+        let mut per_side = [0; 2];
+        for (f, _) in world.query::<(&Faction, &crate::sim::platoon::Platoon)>().iter(world) {
+            per_side[f.index()] += 1;
+        }
+        assert_eq!(per_side[0], 3, "Humans placed the default army");
+        assert!(per_side[1] >= 3, "the Termbot commander placed its own army");
         let supply = world.resource::<Supply>();
-        assert!(supply.0[0] < 100.0 && supply.0[0] == supply.0[1], "both spent the same: {:?}", supply.0);
+        assert!(supply.0[0] < 100.0 && supply.0[1] < 200.0, "both spent their budget: {:?}", supply.0);
     }
 
     #[test]
@@ -289,11 +407,12 @@ mod tests {
         }
     }
 
+    /// Against a passive human army the commander may attack or just take
+    /// the empty sectors; either way the match must replay identically.
     #[test]
-    fn battle_happens_and_is_deterministic() {
-        let (a, shots_a) = run_headless(42, 120);
-        let (b, shots_b) = run_headless(42, 120);
-        assert!(shots_a > 20, "expected a firefight, got {shots_a} shots");
+    fn match_against_passive_player_is_deterministic() {
+        let (a, shots_a) = run_headless(7, 150);
+        let (b, shots_b) = run_headless(7, 150);
         assert_eq!(shots_a, shots_b);
         assert_eq!(a, b, "same seed and orders must replay identically");
     }

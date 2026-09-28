@@ -87,6 +87,9 @@ pub struct Condition {
     /// Cover it has right now against the threats it knows about
     /// (directional; updated when it re-thinks).
     pub cover: CoverLevel,
+    /// Tick it last fired. Firing is visible to anyone watching (tracers),
+    /// so the enemy commander may use it.
+    pub last_shot_tick: Option<u64>,
 }
 
 impl Condition {
@@ -100,6 +103,7 @@ impl Condition {
             fire_target: None,
             next_think: 0,
             cover: CoverLevel::None,
+            last_shot_tick: None,
         }
     }
 }

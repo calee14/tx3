@@ -2,7 +2,7 @@
 
 A real-time 2D strategy commander game built with Rust and [Bevy](https://bevy.org) 0.19.
 
-This covers **steps 1–4** of the build order in the design doc:
+This covers **steps 1–4 and 7** of the build order in the design doc:
 - a procedurally generated mirrored map with fog of war
 - platoons of 1–5 fighters with rolled traits
 - missions and signals with confusion
@@ -11,8 +11,22 @@ This covers **steps 1–4** of the build order in the design doc:
 - a hidden setup phase for placing your army
 - reinforcements on foot or by vehicle (the vehicle parks as cover)
 - territory control and a 15-minute timer
+- an AI Termbot commander that reads your moves and counters them live
 
-The Termbots follow a fixed placeholder script until the real Termbot AI arrives in step 7. They place the default army, open with two assaults and an overwatch, and buy a reinforcement every 75 seconds.
+## The Termbot commander
+
+The Termbots are commanded by an AI that plays by your rules. It only knows about your units on ground it has explored. It never sees your missions, and it reads your intent from how your units move and whether they're shooting. It commands through the same signals, so its platoons get confused if it over-orders them.
+
+- **Personality:** each match it picks a style: aggressive, balanced or defensive. The style decides its army, where it sets up (hidden from your opening view), and how readily it attacks.
+- **Live counters:** every 2 seconds it groups your visible units and reads what they're doing:
+  - Your units advance: it digs in (Overwatch).
+  - Your units rush: it assaults where they're heading, to catch them in the open.
+  - Your units sit and fire: it flanks out of your firing lane, or slips away if it's weaker.
+  - Now and then it picks a bolder option, so it isn't perfectly predictable.
+- **Posture:** it scouts early, holds and probes your line, pushes your weakest sector when it has the edge or is behind on territory late, runs down your King when clearly winning, and rushes back to defend its own King.
+- **Spending:** it buys reinforcements that counter what it has seen, sends them behind its front (by vehicle when far away or urgent), and regroups when losing badly.
+
+Press **F** for the debug view: the whole map, plus the commander's recent decisions and reasoning.
 
 ## How a match goes
 
@@ -57,7 +71,7 @@ Run the tests with `cargo test`.
 | WASD / arrow keys / middle-mouse drag | Pan the camera |
 | Mouse wheel | Zoom |
 | Space | Pause / resume (single-player only). Orders given while paused apply on resume |
-| F | Debug: toggle fog of war off |
+| F | Debug view: fog off, plus the Termbot commander's thoughts |
 | N | New map (next seed) |
 
 Every signal adds confusion to the platoon, and contradictory signals in quick succession add a lot. Confused platoons act on orders late, and very confused ones freeze.
@@ -101,7 +115,11 @@ src/
     perception.rs    Unit vision and line of sight
   fog.rs             Per-tile commander fog + overlay
   pathfinding.rs     A* on the tile grid
-  commander.rs       Default army; placeholder Termbot script
+  commander.rs       The default army (setup button)
+  termbot/
+    mod.rs           The AI commander: posture, counters, King safety, spending
+    intel.rs         What it sees; reading enemy groups' behaviour
+    planning.rs      Its style, hidden setup placement, reinforcement choice
   army_panel.rs      Platoon builder: setup placement and reinforcements
   units.rs           Unit visuals: sprites, status icons, health bars, tracers
   input.rs           Selection, mission buttons, signals -> commands; pause
@@ -113,8 +131,10 @@ Game logic (map generation, pathfinding, line of sight) has no rendering code an
 
 ## Tests
 
-`cargo test` also runs headless matches. They check that setup places both armies, that a vehicle delivers its platoon and parks as an obstacle, that the timer ends the match on territory, and that the same seed replays a two-minute battle identically. Debug reports: `cargo test battle_report -- --ignored --nocapture` (battle summary per seed), `cargo test cover_report -- --ignored --nocapture` (how often fighters in contact are in cover), and `SEED=42 SECS=90 cargo test fighter_report -- --ignored --nocapture` (every fighter's state at a moment).
+`cargo test` also runs headless matches. They check that setup places both armies, that a vehicle delivers its platoon and parks as an obstacle, that the timer ends the match on territory, and that the same seed replays a two-minute battle identically. The tests also check that the AI commander only knows what its side has seen, never confuses its own platoons into freezing, and plays identically from the same seed.
+
+Debug reports: `AI_VS_AI=1 SEED=42 MINS=10 cargo test ai_report -- --ignored --nocapture` (watch the AI's decisions, optionally commanding both sides), `cargo test battle_report -- --ignored --nocapture` (battle summary per seed), `cargo test cover_report -- --ignored --nocapture` (how often fighters in contact are in cover), and `SEED=42 SECS=90 cargo test fighter_report -- --ignored --nocapture` (every fighter's state at a moment).
 
 ## Next: step 5
 
-Engineers, with mines, bombs, turrets and artillery emplacements, and traps that stay hidden until a fighter detects them.
+Engineers, with mines, bombs, turrets and artillery emplacements, and traps that stay hidden until a fighter detects them. The commander will learn to use them too.

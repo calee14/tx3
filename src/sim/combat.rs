@@ -138,6 +138,7 @@ type UnitQuery<'a> = (
 );
 
 pub fn fire_weapons(
+    tick: Res<super::SimTick>,
     map: Res<GameMap>,
     mut rng: ResMut<SimRng>,
     mut log: ResMut<ShotLog>,
@@ -246,6 +247,7 @@ pub fn fire_weapons(
         let ready_bonus = if me.mission == Some(Mission::Overwatch) && !me.moving { 0.8 } else { 1.0 };
         cond.fire_cooldown = stats.fire_interval * rng.0.random_range(0.9..1.1) * ready_bonus;
         cond.fire_target = Some(target);
+        cond.last_shot_tick = Some(tick.0);
         log.0.push(ShotRecord { from: *pos, to: t.pos, hit, shooter_class: fighter.class });
     }
 

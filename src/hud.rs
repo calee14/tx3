@@ -88,6 +88,7 @@ fn update_hud(
     phase: Res<MatchPhase>,
     territory: Res<Territory>,
     units: Query<(&Faction, Option<&Fighter>)>,
+    ais: Option<Res<crate::termbot::AiCommanders>>,
     mut text: Single<&mut Text, With<HudText>>,
 ) {
     let enemy = match local.0 {
@@ -96,7 +97,7 @@ fn update_hud(
     };
     let count = |f: Faction| units.iter().filter(|(uf, fi)| **uf == f && fi.is_some()).count();
     let mut lines = vec![
-        format!("TERMBOTS vs HUMANS  -  prototype step 4   (you: {})", local.0.name()),
+        format!("TERMBOTS vs HUMANS  -  prototype   (you: {})", local.0.name()),
         if phase.battle {
             let left = seconds_left(tick.0);
             format!(
@@ -151,7 +152,27 @@ fn update_hud(
     lines.push("1/2/3 or buttons: mission   Right-click: target".into());
     lines.push("Hover a fighter for details".into());
     lines.push("WASD/arrows/middle-drag: pan   Wheel: zoom".into());
-    lines.push("Space: pause   F: toggle fog   N: new map".into());
+    lines.push("Space: pause   F: debug view (no fog + AI thoughts)   N: new map".into());
+
+    // Debug view: what the enemy commander is thinking.
+    if fog_debug.show_all
+        && let Some(ais) = ais
+    {
+        for brain in ais.brains.iter().filter(|b| b.faction != local.0) {
+            lines.push(String::new());
+            lines.push(format!(
+                "{} commander (debug): {} style, {}   losses seen: own {:.0}, enemy {:.0}",
+                brain.faction.name(),
+                brain.style.name(),
+                brain.posture.name(),
+                brain.our_losses,
+                brain.enemy_losses
+            ));
+            for line in &brain.log {
+                lines.push(format!("  {line}"));
+            }
+        }
+    }
     text.0 = lines.join("\n");
 }
 

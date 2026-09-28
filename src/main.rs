@@ -4,7 +4,8 @@
 //! fog of war, and the fixed-timestep simulation; platoons of 1-5 fighters
 //! with rolled traits, missions, signals and confusion, and autonomous
 //! fighters; Supply, a hidden setup phase, reinforcements on foot or by
-//! vehicle, territory and the 15-minute timer.
+//! vehicle, territory and the 15-minute timer; and the Termbot AI
+//! commander (step 7).
 
 mod army_panel;
 mod camera;
@@ -17,6 +18,7 @@ mod input;
 mod map;
 mod pathfinding;
 mod sim;
+mod termbot;
 mod units;
 
 use bevy::prelude::*;
@@ -43,7 +45,7 @@ fn main() {
             hud::HudPlugin,
             game::GamePlugin,
             units::UnitVisualsPlugin,
-            commander::CommanderPlugin,
+            termbot::TermbotPlugin,
             army_panel::ArmyPanelPlugin,
         ))
         .add_systems(Update, (map::render::draw_sector_borders, map::render::color_sector_labels))

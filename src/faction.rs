@@ -19,6 +19,13 @@ impl Faction {
         }
     }
 
+    pub fn opponent(self) -> Faction {
+        match self {
+            Faction::Humans => Faction::Termbots,
+            Faction::Termbots => Faction::Humans,
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Faction::Humans => "Humans",
