@@ -1,0 +1,33 @@
+[package]
+name = "termbots"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Pinned to the latest stable Bevy. Upgrade deliberately: each minor
+# version has breaking changes and a migration guide.
+# No "audio" feature: the game has no sound for now.
+bevy = { version = "=0.19.1", default-features = false, features = ["2d", "ui"] }
+
+# Deterministic, seedable RNG owned by the simulation (same seed = same map,
+# same rolls). Important for replays and multiplayer later.
+rand = { version = "0.9", default-features = false, features = ["std"] }
+rand_chacha = { version = "0.9", default-features = false, features = ["std"] }
+
+[features]
+# `cargo run --features dev` enables Bevy's dynamic linking for much faster
+# rebuilds during development. Don't ship builds with it.
+dev = ["bevy/dynamic_linking"]
+
+# Compile our code with light optimization and dependencies (Bevy) with full
+# optimization. The game stays fast in debug builds while our own crate
+# still recompiles quickly.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
