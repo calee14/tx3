@@ -1,11 +1,12 @@
 //! Termbots vs Humans: a real-time 2D strategy commander game.
 //!
-//! Steps 1-3 of the build order: a procedurally generated, mirrored map,
-//! top-down camera, fog of war, and the fixed-timestep simulation; mixed
-//! platoons of fighters with rolled traits, missions, signals and
-//! confusion, and autonomous fighters that move, shoot and take cover on
-//! their own.
+//! Steps 1-4 of the build order: a procedurally generated, mirrored map,
+//! fog of war, and the fixed-timestep simulation; platoons of 1-5 fighters
+//! with rolled traits, missions, signals and confusion, and autonomous
+//! fighters; Supply, a hidden setup phase, reinforcements on foot or by
+//! vehicle, territory and the 15-minute timer.
 
+mod army_panel;
 mod camera;
 mod commander;
 mod faction;
@@ -43,7 +44,8 @@ fn main() {
             game::GamePlugin,
             units::UnitVisualsPlugin,
             commander::CommanderPlugin,
+            army_panel::ArmyPanelPlugin,
         ))
-        .add_systems(Update, map::render::draw_sector_borders)
+        .add_systems(Update, (map::render::draw_sector_borders, map::render::color_sector_labels))
         .run();
 }

@@ -15,6 +15,10 @@ use bevy::window::PrimaryWindow;
 use crate::faction::{Faction, LocalPlayer};
 use crate::fog::FogDebug;
 use crate::map::{TILE_SIZE, TilePos};
+use crate::army_panel::ArmyBuilder;
+use crate::fog::FogOfWar;
+use crate::map::GameMap;
+use crate::sim::economy::MatchPhase;
 use crate::sim::fighter::Fighter;
 use crate::sim::platoon::{Mission, Platoon};
 use crate::sim::{CommandQueue, Mover, SimCommand, Unit, UnitClass};
@@ -33,9 +37,17 @@ impl Plugin for InputPlugin {
                 Update,
                 (
                     update_cursor,
-                    (mission_buttons, mission_hotkeys, select_and_command, draw_selection, update_orders_panel)
+                    (
+                        mission_buttons,
+                        mission_hotkeys,
+                        select_and_command,
+                        draw_selection,
+                        update_orders_panel,
+                        draw_placement_preview,
+                    )
                         .chain()
-                        .run_if(resource_exists::<CommandQueue>),
+                        .run_if(resource_exists::<CommandQueue>)
+                        .run_if(resource_exists::<MatchPhase>),
                     draw_hover,
                     toggle_pause,
                     toggle_fog_debug,
@@ -49,7 +61,8 @@ impl Plugin for InputPlugin {
 #[derive(Resource, Default)]
 pub struct CursorWorld {
     pub world: Option<Vec2>,
-    /// True while the cursor is over a UI button (world clicks ignored).
+    /// True while the cursor is over a UI panel or button (world clicks
+    /// ignored).
     pub over_ui: bool,
 }
 
@@ -84,7 +97,7 @@ fn update_cursor(
     mut cursor: ResMut<CursorWorld>,
     window: Single<&Window, With<PrimaryWindow>>,
     camera: Single<(&Camera, &GlobalTransform), With<Camera2d>>,
-    buttons: Query<&Interaction, With<MissionButton>>,
+    buttons: Query<&Interaction>,
 ) {
     let (camera, camera_transform) = *camera;
     cursor.world = window
@@ -114,10 +127,11 @@ fn spawn_orders_panel(mut commands: Commands) {
             flex_direction: FlexDirection::Column,
             align_items: AlignItems::Center,
             padding: UiRect::all(Val::Px(8.0)),
+            display: Display::None,
             ..default()
         },
         BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.7)),
-        Visibility::Hidden,
+        Interaction::default(),
         children![
             (OrdersText, Text::new(""), TextFont::from_font_size(14.0), TextColor(Color::WHITE)),
             (
@@ -165,6 +179,8 @@ fn select_and_command(
     buttons: Res<ButtonInput<MouseButton>>,
     cursor: Res<CursorWorld>,
     local: Res<LocalPlayer>,
+    phase: Res<MatchPhase>,
+    mut builder: ResMut<ArmyBuilder>,
     mut selection: ResMut<Selection>,
     mut pending: ResMut<PendingMission>,
     mut queue: ResMut<CommandQueue>,
@@ -175,6 +191,26 @@ fn select_and_command(
         return;
     }
     let Some(world) = cursor.world else { return };
+
+    // A platoon is being built in the army panel: clicks place / deploy it.
+    if !builder.is_empty() {
+        if buttons.just_pressed(MouseButton::Right) {
+            builder.classes.clear();
+        } else if buttons.just_pressed(MouseButton::Left)
+            && let Some(tile) = TilePos::from_world(world)
+        {
+            let classes = std::mem::take(&mut builder.classes);
+            queue.push(if phase.battle {
+                SimCommand::Deploy { issuer: local.0, classes, vehicle: builder.vehicle, target: tile }
+            } else {
+                SimCommand::PlacePlatoon { issuer: local.0, classes, anchor: tile }
+            });
+        }
+        return;
+    }
+    if !phase.battle {
+        return;
+    }
 
     if buttons.just_pressed(MouseButton::Left) {
         let clicked = units
@@ -266,18 +302,23 @@ fn draw_selection(
 }
 
 fn update_orders_panel(
+    phase: Res<MatchPhase>,
     selection: Res<Selection>,
     pending: Res<PendingMission>,
     platoons: Query<&Platoon>,
-    mut panel: Single<&mut Visibility, With<OrdersPanel>>,
+    mut panel: Single<&mut Node, With<OrdersPanel>>,
     mut text: Single<&mut Text, With<OrdersText>>,
 ) {
     let Selection::Platoon(e) = *selection else {
-        **panel = Visibility::Hidden;
+        panel.display = Display::None;
         return;
     };
+    if !phase.battle {
+        panel.display = Display::None;
+        return;
+    }
     let Ok(platoon) = platoons.get(e) else { return };
-    **panel = Visibility::Inherited;
+    panel.display = Display::Flex;
     let mut line = format!(
         "{}  |  {} fighters  |  Mission: {}  |  Confusion: {:.0} ({})",
         platoon.name,
@@ -294,6 +335,36 @@ fn update_orders_panel(
         None => "\nPick a mission, then right-click a target".to_string(),
     });
     text.0 = line;
+}
+
+/// While a platoon is being built: show where it would go, green if the
+/// click would be accepted (your half in setup, explored ground in battle).
+fn draw_placement_preview(
+    builder: Res<ArmyBuilder>,
+    cursor: Res<CursorWorld>,
+    phase: Res<MatchPhase>,
+    local: Res<LocalPlayer>,
+    map: Res<GameMap>,
+    fog: Res<FogOfWar>,
+    mut gizmos: Gizmos,
+) {
+    if builder.is_empty() || cursor.over_ui {
+        return;
+    }
+    let Some(tile) = cursor.tile() else { return };
+    let ok = if phase.battle {
+        fog.is_explored(local.0, tile) && map.tile(tile).passable()
+    } else {
+        map.in_home_half(local.0, tile)
+    };
+    let color = if ok { Color::srgb(0.3, 1.0, 0.4) } else { Color::srgb(1.0, 0.3, 0.3) };
+    for slot in 0..builder.classes.len() {
+        let p = crate::sim::platoon::slot_tile(tile, slot, local.0);
+        gizmos.circle_2d(Isometry2d::from_translation(p.to_world()), 5.0, color);
+    }
+    if phase.battle && builder.vehicle {
+        gizmos.rect_2d(Isometry2d::from_translation(tile.to_world()), Vec2::new(18.0, 11.0), color);
+    }
 }
 
 fn draw_hover(cursor: Res<CursorWorld>, mut gizmos: Gizmos) {

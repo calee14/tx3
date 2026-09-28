@@ -13,9 +13,11 @@
 pub mod ai;
 pub mod classes;
 pub mod combat;
+pub mod economy;
 pub mod fighter;
 pub mod perception;
 pub mod platoon;
+pub mod vehicle;
 
 use std::collections::{HashMap, VecDeque};
 
@@ -50,23 +52,34 @@ impl Plugin for SimPlugin {
                     SimSet::Movement,
                     SimSet::Combat,
                     SimSet::Aftermath,
+                    SimSet::Vehicles,
                     SimSet::Intel,
+                    SimSet::Territory,
                     SimSet::Record,
                 )
                     .chain()
                     .run_if(resource_exists::<GameMap>)
+                    .run_if(economy::in_battle)
                     .run_if(match_running),
             )
             .add_systems(
                 FixedUpdate,
+                economy::process_setup_commands.run_if(resource_exists::<GameMap>).run_if(economy::in_setup),
+            )
+            .add_systems(
+                FixedUpdate,
                 (
-                    (advance_tick, process_commands).chain().in_set(SimSet::Commands),
+                    (advance_tick, economy::accrue_supply, process_commands, economy::process_deployments)
+                        .chain()
+                        .in_set(SimSet::Commands),
                     platoon::update_platoons.in_set(SimSet::Platoons),
                     perception::update_perception.in_set(SimSet::Perception),
                     ai::decide.in_set(SimSet::Decide),
                     move_units.in_set(SimSet::Movement),
                     combat::fire_weapons.in_set(SimSet::Combat),
                     (combat::update_conditions, combat::remove_dead).chain().in_set(SimSet::Aftermath),
+                    vehicle::update_vehicles.in_set(SimSet::Vehicles),
+                    (economy::update_territory, economy::check_timer).chain().in_set(SimSet::Territory),
                     record_interpolation.in_set(SimSet::Record),
                 ),
             )
@@ -75,7 +88,7 @@ impl Plugin for SimPlugin {
 }
 
 fn match_running(outcome: Option<Res<MatchOutcome>>) -> bool {
-    outcome.is_none_or(|o| o.winner.is_none())
+    outcome.is_none_or(|o| !o.ended)
 }
 
 /// Stages of one simulation tick, in order.
@@ -95,8 +108,12 @@ pub enum SimSet {
     Combat,
     /// Morale, suppression recovery, deaths.
     Aftermath,
+    /// Vehicles that arrived (or were destroyed) unload their platoon.
+    Vehicles,
     /// Update each commander's knowledge (fog) from perception.
     Intel,
+    /// Sector control and the match timer.
+    Territory,
     /// Snapshot positions for smooth rendering between ticks.
     Record,
 }
@@ -122,6 +139,7 @@ pub struct UnitIndex {
     pub platoons: HashMap<PlatoonId, Entity>,
     next_id: u32,
     next_platoon: u32,
+    platoon_numbers: [u32; 2],
 }
 
 impl UnitIndex {
@@ -129,6 +147,13 @@ impl UnitIndex {
         let id = UnitId(self.next_id);
         self.next_id += 1;
         id
+    }
+
+    /// Per-side platoon counter, for call signs (Alpha, Bravo, ...).
+    pub fn next_platoon_number(&mut self, faction: Faction) -> u32 {
+        let n = self.platoon_numbers[faction.index()];
+        self.platoon_numbers[faction.index()] += 1;
+        n
     }
 
     pub fn allocate_platoon(&mut self) -> PlatoonId {
@@ -145,6 +170,16 @@ pub enum SimCommand {
     Move { issuer: Faction, unit: UnitId, target: TilePos },
     /// The King signals a platoon: a mission and where to carry it out.
     Signal { issuer: Faction, platoon: PlatoonId, mission: Mission, target: TilePos },
+    /// Setup only: buy a platoon (1-5 fighters) and place it at `anchor`,
+    /// inside your own half.
+    PlacePlatoon { issuer: Faction, classes: Vec<FighterClass>, anchor: TilePos },
+    /// Setup only: take back the last placed platoon (refunded).
+    UndoPlacement { issuer: Faction },
+    /// Setup only: done placing. The battle starts when both sides are ready.
+    Ready { issuer: Faction },
+    /// Battle: buy a platoon (1-5 fighters) and send it to an explored
+    /// tile, on foot from base or by vehicle (costs more).
+    Deploy { issuer: Faction, classes: Vec<FighterClass>, vehicle: bool, target: TilePos },
 }
 
 /// Commands waiting for the next tick. Commands issued while the game is
@@ -158,12 +193,23 @@ impl CommandQueue {
     pub fn push(&mut self, command: SimCommand) {
         self.pending.push(command);
     }
+
+    pub fn take_all(&mut self) -> Vec<SimCommand> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Remove and return the commands matching `f`, keeping the rest.
+    pub fn take_matching(&mut self, f: impl Fn(&SimCommand) -> bool) -> Vec<SimCommand> {
+        self.pending.extract_if(.., |c| f(c)).collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnitClass {
     King,
     Fighter(FighterClass),
+    /// A troop transport on its way to a drop-off.
+    Vehicle,
 }
 
 impl UnitClass {
@@ -171,6 +217,7 @@ impl UnitClass {
         match self {
             UnitClass::King => "King",
             UnitClass::Fighter(class) => class.stats().name,
+            UnitClass::Vehicle => "Troop vehicle",
         }
     }
 
@@ -178,6 +225,7 @@ impl UnitClass {
         match self {
             UnitClass::King => "K",
             UnitClass::Fighter(class) => class.stats().letter,
+            UnitClass::Vehicle => "V",
         }
     }
 }
@@ -260,7 +308,7 @@ pub fn process_commands(
     mut platoons: Query<(&Faction, &mut Platoon)>,
     traits: Query<&Traits>,
 ) {
-    for command in queue.pending.drain(..) {
+    for command in queue.take_matching(|c| matches!(c, SimCommand::Move { .. } | SimCommand::Signal { .. })) {
         match command {
             SimCommand::Move { issuer, unit, target } => {
                 let Some(&entity) = index.entities.get(&unit) else { continue };
@@ -283,6 +331,7 @@ pub fn process_commands(
                 let leadership = platoon.leader.and_then(|l| traits.get(l).ok()).map_or(0.0, |t| t.lead());
                 platoon::receive_signal(&mut platoon, mission, target, tick.0, leadership);
             }
+            _ => {}
         }
     }
 }

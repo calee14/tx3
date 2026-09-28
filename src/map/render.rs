@@ -63,7 +63,7 @@ fn tile_pixel(map: &GameMap, pos: TilePos, lx: i32, ly: i32) -> Rgb {
                 color = if ly == 2 || lx == 1 { [0.55, 0.47, 0.30] } else { [0.78, 0.68, 0.46] };
             }
         }
-        Feature::Rock | Feature::Wall => {
+        Feature::Rock | Feature::Wall | Feature::Vehicle => {
             let rock = tile.feature == Feature::Rock;
             // Solid fill with a dark outline wherever the obstacle ends, so
             // multi-tile outcrops and ruins read as one shape.
@@ -150,11 +150,33 @@ pub fn spawn_map_visuals(commands: &mut Commands, images: &mut Assets<Image>, ma
     for sector in &map.sectors {
         commands.spawn((
             MatchEntity,
+            SectorLabel(sector.id),
             Text2d::new(sector.name.clone()),
             TextFont::from_font_size(40.0),
             TextColor(Color::srgba(1.0, 1.0, 1.0, 0.35)),
             Transform::from_translation(sector.center_world().extend(Z_LABELS)),
         ));
+    }
+}
+
+/// Marks a sector's name label, so it can be tinted by who controls it.
+#[derive(Component)]
+pub struct SectorLabel(pub usize);
+
+/// Sector names take the color of the side that controls them.
+pub fn color_sector_labels(
+    territory: Option<Res<crate::sim::economy::Territory>>,
+    mut labels: Query<(&SectorLabel, &mut TextColor)>,
+) {
+    let Some(territory) = territory else { return };
+    for (label, mut color) in &mut labels {
+        let c = match territory.owner[label.0] {
+            Some(faction) => faction.color().with_alpha(0.55),
+            None => Color::srgba(1.0, 1.0, 1.0, 0.35),
+        };
+        if color.0 != c {
+            color.0 = c;
+        }
     }
 }
 

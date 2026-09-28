@@ -35,10 +35,13 @@ pub struct ShotRecord {
 #[derive(Resource, Default)]
 pub struct ShotLog(pub Vec<ShotRecord>);
 
-/// Set when a King dies. The simulation stops.
+/// Set when the match ends (a King dies, or time runs out). The
+/// simulation stops. `winner` is None for a draw.
 #[derive(Resource, Default)]
 pub struct MatchOutcome {
+    pub ended: bool,
     pub winner: Option<Faction>,
+    pub reason: String,
 }
 
 /// Everything that affects one shot's hit chance.
@@ -153,7 +156,11 @@ pub fn fire_weapons(
                 moving: !mover.path.is_empty(),
                 mission: mission_of(fighter),
                 health: health.frac(),
-                armor: fighter.map_or(0.0, |f| f.class.stats().armor),
+                armor: match unit.class {
+                    UnitClass::Fighter(class) => class.stats().armor,
+                    UnitClass::Vehicle => super::vehicle::VEHICLE_ARMOR,
+                    UnitClass::King => 0.0,
+                },
                 is_king: unit.class == UnitClass::King,
             },
         );
@@ -257,15 +264,17 @@ pub fn fire_weapons(
 /// health, incoming fire and whether the platoon leader is nearby.
 pub fn update_conditions(
     map: Res<GameMap>,
+    territory: Option<Res<super::economy::Territory>>,
     platoons: Query<&Platoon>,
     leaders: Query<(&TilePos, &Traits)>,
-    mut fighters: Query<(&TilePos, &Fighter, &Traits, &Health, &mut Condition)>,
+    mut fighters: Query<(&TilePos, &Faction, &Fighter, &Traits, &Health, &mut Condition)>,
 ) {
-    for (pos, fighter, traits, health, mut cond) in &mut fighters {
+    for (pos, faction, fighter, traits, health, mut cond) in &mut fighters {
         let decay = if map.cover_at(*pos) != CoverLevel::None { 28.0 } else { 18.0 };
         cond.suppression = (cond.suppression - decay * DT).max(0.0);
 
-        let mut target = morale_baseline(traits) - cond.suppression * 0.3 - (1.0 - health.frac()) * 20.0;
+        let mut target = morale_baseline(traits) - cond.suppression * 0.3 - (1.0 - health.frac()) * 20.0
+            + territory.as_ref().map_or(0.0, |t| t.morale_bonus(*faction));
         if let Some((leader_pos, leader_traits)) = platoons
             .get(fighter.platoon)
             .ok()
@@ -282,26 +291,35 @@ pub fn update_conditions(
 }
 
 /// Remove the dead. Nearby allies lose morale (more if it was their
-/// leader). A dead King ends the match.
+/// leader). A dead King ends the match. A destroyed vehicle is handed to
+/// `update_vehicles`, which bails its passengers out.
+#[allow(clippy::too_many_arguments)]
 pub fn remove_dead(
     mut commands: Commands,
     mut index: ResMut<UnitIndex>,
     mut outcome: ResMut<MatchOutcome>,
     platoons: Query<&Platoon>,
     dead: Query<(Entity, &Unit, &Faction, &TilePos, &Health, Option<&Fighter>)>,
+    mut vehicles: Query<&mut super::vehicle::Vehicle>,
     mut fighters: Query<(&TilePos, &Faction, &Fighter, &Traits, &mut Condition)>,
 ) {
     for (entity, unit, faction, pos, health, fighter) in &dead {
         if health.current > 0.0 {
             continue;
         }
+        if let Ok(mut vehicle) = vehicles.get_mut(entity) {
+            vehicle.destroyed = true;
+            continue;
+        }
         commands.entity(entity).despawn();
         index.entities.remove(&unit.id);
         if unit.class == UnitClass::King {
+            outcome.ended = true;
             outcome.winner = Some(match faction {
                 Faction::Humans => Faction::Termbots,
                 Faction::Termbots => Faction::Humans,
             });
+            outcome.reason = format!("The {} King is down", faction.name());
             info!("{} King killed", faction.name());
             continue;
         }

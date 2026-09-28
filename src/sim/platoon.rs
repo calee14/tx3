@@ -76,7 +76,19 @@ pub struct Platoon {
     pub last_signal_tick: Option<u64>,
     /// A received order not acted on yet (delayed by confusion).
     pub pending: Option<PendingSignal>,
+    /// Supply paid for this platoon (refunded if placement is undone
+    /// during setup).
+    pub paid: f32,
 }
+
+/// Largest allowed platoon.
+pub const MAX_PLATOON_SIZE: usize = 5;
+
+/// Platoon call signs, handed out in order per side.
+pub const CALL_SIGNS: [&str; 16] = [
+    "Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf", "Hotel", "India", "Juliet", "Kilo", "Lima", "Mike",
+    "November", "Oscar", "Papa",
+];
 
 impl Platoon {
     pub fn frozen(&self) -> bool {
@@ -226,6 +238,16 @@ fn centroid_tile(
 
 /// Breadth-first search for the closest walkable tile not in `taken`.
 pub fn nearest_free_tile(map: &GameMap, taken: &HashSet<TilePos>, around: TilePos) -> Option<TilePos> {
+    nearest_free_tile_where(map, taken, around, |_| true)
+}
+
+/// Like `nearest_free_tile`, but only accepts tiles passing `allowed`.
+pub fn nearest_free_tile_where(
+    map: &GameMap,
+    taken: &HashSet<TilePos>,
+    around: TilePos,
+    allowed: impl Fn(TilePos) -> bool,
+) -> Option<TilePos> {
     let mut seen = HashSet::new();
     let mut queue = VecDeque::new();
     // Start from any walkable tile near `around` (it may be inside a rock).
@@ -242,8 +264,13 @@ pub fn nearest_free_tile(map: &GameMap, taken: &HashSet<TilePos>, around: TilePo
             break;
         }
     }
+    let mut steps = 0;
     while let Some(p) = queue.pop_front() {
-        if !taken.contains(&p) {
+        steps += 1;
+        if steps > 4000 {
+            break;
+        }
+        if !taken.contains(&p) && allowed(p) {
             return Some(p);
         }
         for n in map.neighbors(p) {
@@ -255,39 +282,10 @@ pub fn nearest_free_tile(map: &GameMap, taken: &HashSet<TilePos>, around: TilePo
     None
 }
 
-pub struct PlatoonTemplate {
-    pub name: &'static str,
-    pub members: &'static [FighterClass],
-}
-
-/// Each side's starting platoons: mixed classes so every platoon can do a
-/// bit of everything, with a different emphasis.
-pub const STARTING_PLATOONS: [PlatoonTemplate; 3] = [
-    PlatoonTemplate {
-        name: "Rifle",
-        members: &[FighterClass::Assaulter, FighterClass::Assaulter, FighterClass::Assaulter, FighterClass::HeavyWeapons],
-    },
-    PlatoonTemplate {
-        name: "Recon",
-        members: &[FighterClass::Sniper, FighterClass::Sniper, FighterClass::Assaulter],
-    },
-    PlatoonTemplate {
-        name: "Breach",
-        members: &[FighterClass::Juggernaut, FighterClass::Assaulter, FighterClass::Assaulter, FighterClass::HeavyWeapons],
-    },
-];
-
-/// Humans' starting platoon positions; Termbots get the mirrored tiles.
-const HUMAN_PLATOON_ANCHORS: [TilePos; 3] = [TilePos::new(52, 17), TilePos::new(63, 20), TilePos::new(74, 17)];
 const KING_HEALTH: f32 = 150.0;
 
-/// Spawn one side's King and starting platoons (simulation components
-/// only; visuals are attached separately so the sim can run headless).
-pub fn spawn_forces(commands: &mut Commands, index: &mut UnitIndex, rng: &mut impl Rng, map: &GameMap, faction: Faction) {
-    let mut taken: HashSet<TilePos> = HashSet::new();
-
+pub fn spawn_king(commands: &mut Commands, index: &mut UnitIndex, map: &GameMap, faction: Faction) -> Entity {
     let king_pos = map.spawn(faction);
-    taken.insert(king_pos);
     let king_id = index.allocate();
     let king = commands
         .spawn((
@@ -304,59 +302,93 @@ pub fn spawn_forces(commands: &mut Commands, index: &mut UnitIndex, rng: &mut im
         ))
         .id();
     index.entities.insert(king_id, king);
+    king
+}
 
-    for (i, template) in STARTING_PLATOONS.iter().enumerate() {
-        let anchor_human = HUMAN_PLATOON_ANCHORS[i];
-        let anchor = match faction {
-            Faction::Humans => anchor_human,
-            Faction::Termbots => anchor_human.mirrored(),
-        };
-        let anchor = nearest_free_tile(map, &HashSet::new(), anchor).unwrap_or(anchor);
-        let platoon_id = index.allocate_platoon();
-        let platoon_entity = commands.spawn((MatchEntity, faction)).id();
+/// A fighter that has been bought but not spawned yet (e.g. riding in a
+/// vehicle). Traits are rolled at purchase.
+#[derive(Clone, Copy, Debug)]
+pub struct Recruit {
+    pub class: FighterClass,
+    pub traits: Traits,
+}
 
-        let mut members = Vec::new();
-        for (slot, &class) in template.members.iter().enumerate() {
-            let stats = class.stats();
-            let traits = Traits::roll(&stats.traits, rng);
-            let pos = nearest_free_tile(map, &taken, slot_tile(anchor, slot, faction)).unwrap_or(anchor);
-            taken.insert(pos);
-            let id = index.allocate();
-            let fighter = commands
-                .spawn((
-                    MatchEntity,
-                    Unit { id, class: UnitClass::Fighter(class) },
-                    faction,
-                    pos,
-                    Mover::new(stats.speed),
-                    Vision { radius: stats.vision },
-                    Perception::default(),
-                    SimInterp::at(pos.to_world()),
-                    Transform::from_translation(pos.to_world().extend(0.0)),
-                    Fighter { class, platoon: platoon_entity, slot },
-                    traits,
-                    Health::new(stats.max_health),
-                    Condition::new(&traits),
-                ))
-                .id();
-            index.entities.insert(id, fighter);
-            members.push(fighter);
-        }
+pub fn roll_recruits(classes: &[FighterClass], rng: &mut impl Rng) -> Vec<Recruit> {
+    classes.iter().map(|&class| Recruit { class, traits: Traits::roll(&class.stats().traits, rng) }).collect()
+}
 
-        commands.entity(platoon_entity).insert(Platoon {
-            id: platoon_id,
-            name: format!("{} {}", template.name, i + 1),
-            mission: Mission::Overwatch,
-            target: anchor,
-            anchor,
-            members,
-            leader: None,
-            confusion: 0.0,
-            last_signal_tick: None,
-            pending: None,
-        });
-        index.platoons.insert(platoon_id, platoon_entity);
+/// Everything needed to put a new platoon on the field.
+pub struct NewPlatoon<'a> {
+    pub faction: Faction,
+    pub recruits: &'a [Recruit],
+    pub anchor: TilePos,
+    pub mission: Mission,
+    pub target: TilePos,
+    pub paid: f32,
+}
+
+/// Spawn a platoon's fighters around `anchor` (simulation components only;
+/// visuals are attached separately so the sim can run headless). Fighters
+/// go on free walkable tiles that pass `allowed`. Returns the platoon
+/// entity and its fighters.
+pub fn spawn_platoon(
+    commands: &mut Commands,
+    index: &mut UnitIndex,
+    map: &GameMap,
+    taken: &mut HashSet<TilePos>,
+    new: NewPlatoon,
+    allowed: impl Fn(TilePos) -> bool,
+) -> (Entity, Vec<Entity>) {
+    let faction = new.faction;
+    let platoon_id = index.allocate_platoon();
+    let number = index.next_platoon_number(faction);
+    let platoon_entity = commands.spawn((MatchEntity, faction)).id();
+
+    let mut members = Vec::new();
+    for (slot, recruit) in new.recruits.iter().enumerate().take(MAX_PLATOON_SIZE) {
+        let stats = recruit.class.stats();
+        let pos = nearest_free_tile_where(map, taken, slot_tile(new.anchor, slot, faction), &allowed)
+            .or_else(|| nearest_free_tile(map, taken, new.anchor))
+            .unwrap_or(new.anchor);
+        taken.insert(pos);
+        let id = index.allocate();
+        let fighter = commands
+            .spawn((
+                MatchEntity,
+                Unit { id, class: UnitClass::Fighter(recruit.class) },
+                faction,
+                pos,
+                Mover::new(stats.speed),
+                Vision { radius: stats.vision },
+                Perception::default(),
+                SimInterp::at(pos.to_world()),
+                Transform::from_translation(pos.to_world().extend(0.0)),
+                Fighter { class: recruit.class, platoon: platoon_entity, slot },
+                recruit.traits,
+                Health::new(stats.max_health),
+                Condition::new(&recruit.traits),
+            ))
+            .id();
+        index.entities.insert(id, fighter);
+        members.push(fighter);
     }
+
+    let name = CALL_SIGNS.get(number as usize).map_or_else(|| format!("Platoon {}", number + 1), |n| n.to_string());
+    commands.entity(platoon_entity).insert(Platoon {
+        id: platoon_id,
+        name,
+        mission: new.mission,
+        target: new.target,
+        anchor: if new.mission == Mission::Assault { new.anchor } else { new.target },
+        members: members.clone(),
+        leader: None,
+        confusion: 0.0,
+        last_signal_tick: None,
+        pending: None,
+        paid: new.paid,
+    });
+    index.platoons.insert(platoon_id, platoon_entity);
+    (platoon_entity, members)
 }
 
 #[cfg(test)]
@@ -375,6 +407,7 @@ mod tests {
             confusion: 0.0,
             last_signal_tick: None,
             pending: None,
+            paid: 0.0,
         }
     }
 

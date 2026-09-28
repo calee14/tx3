@@ -31,8 +31,9 @@ pub struct Perception {
     /// Enemy units this unit can currently see.
     pub seen_enemies: Vec<Entity>,
     visible_set: HashSet<TilePos>,
-    /// Where the visible tiles were computed from (recomputed on move).
-    computed_at: Option<TilePos>,
+    /// Where (and on which map version) the visible tiles were computed
+    /// from: recomputed on move or when terrain changes.
+    computed_at: Option<(TilePos, u32)>,
 }
 
 /// Is there a clear line of sight from `from` to `to`?
@@ -121,13 +122,13 @@ pub fn update_perception(
     all_targets.sort_by_key(|t| t.3);
 
     for (faction, pos, vision, mut perception) in &mut viewers {
-        // Terrain doesn't change, so sight only needs recomputing on move.
-        if perception.computed_at != Some(*pos) {
+        // Sight only needs recomputing on move or when terrain changes.
+        if perception.computed_at != Some((*pos, map.version)) {
             let tiles = visible_tiles(&map, *pos, vision.radius);
             let p = perception.as_mut();
             p.visible_set = tiles.iter().copied().collect();
             p.visible_tiles = tiles;
-            p.computed_at = Some(*pos);
+            p.computed_at = Some((*pos, map.version));
         }
         let seen_enemies: Vec<Entity> = all_targets
             .iter()

@@ -16,6 +16,7 @@ use crate::sim::classes::FighterClass;
 use crate::sim::combat::ShotLog;
 use crate::sim::fighter::{Condition, Fighter, Health, statuses};
 use crate::sim::platoon::Platoon;
+use crate::sim::vehicle::ParkedVehicle;
 use crate::sim::{Mover, Unit, UnitClass};
 
 pub const Z_UNITS: f32 = 10.0;
@@ -30,6 +31,7 @@ impl Plugin for UnitVisualsPlugin {
             Update,
             (
                 attach_unit_visuals,
+                attach_parked_vehicle_visuals,
                 update_status_icons,
                 (draw_unit_overlays, collect_and_draw_tracers).run_if(resource_exists::<FogOfWar>),
             ),
@@ -40,10 +42,39 @@ impl Plugin for UnitVisualsPlugin {
 #[derive(Component)]
 struct StatusIcons;
 
+/// Parked vehicles sit just under the fog layer, like terrain.
+const Z_PARKED: f32 = 4.0;
+
+fn attach_parked_vehicle_visuals(
+    mut commands: Commands,
+    parked: Query<(Entity, &Faction, &TilePos, &ParkedVehicle), Added<ParkedVehicle>>,
+) {
+    for (entity, faction, pos, parked) in &parked {
+        let color = if parked.wrecked {
+            Color::srgb(0.18, 0.17, 0.16)
+        } else {
+            faction.color().darker(0.15)
+        };
+        commands.entity(entity).insert((
+            Sprite::from_color(color, Vec2::new(16.0, 11.0)),
+            Transform::from_translation(pos.to_world().extend(Z_PARKED)),
+            Visibility::default(),
+            children![(
+                Sprite::from_color(Color::srgb(0.1, 0.1, 0.1), Vec2::new(16.0, 2.0)),
+                Transform::from_xyz(0.0, -3.0, 0.1),
+            )],
+        ));
+    }
+}
+
 fn attach_unit_visuals(mut commands: Commands, units: Query<(Entity, &Unit, &Faction), Added<Unit>>) {
     for (entity, unit, faction) in &units {
-        let size = if unit.class == UnitClass::King { UNIT_SPRITE_SIZE + 3.0 } else { UNIT_SPRITE_SIZE };
-        commands.entity(entity).insert((Sprite::from_color(faction.color(), Vec2::splat(size)), Visibility::default()));
+        let (size, color) = match unit.class {
+            UnitClass::King => (Vec2::splat(UNIT_SPRITE_SIZE + 3.0), faction.color()),
+            UnitClass::Vehicle => (Vec2::new(18.0, 11.0), faction.color().darker(0.2)),
+            UnitClass::Fighter(_) => (Vec2::splat(UNIT_SPRITE_SIZE), faction.color()),
+        };
+        commands.entity(entity).insert((Sprite::from_color(color, size), Visibility::default()));
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 Text2d::new(unit.class.letter()),

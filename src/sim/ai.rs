@@ -75,7 +75,7 @@ pub fn decide(
     map: Res<GameMap>,
     mut rng: ResMut<SimRng>,
     platoons: Query<&Platoon>,
-    kings: Query<(&Faction, &TilePos), (With<Unit>, Without<Fighter>)>,
+    kings: Query<(&Unit, &Faction, &TilePos), Without<Fighter>>,
     positions: Query<&TilePos, With<Unit>>,
     mut fighters: Query<(
         Entity,
@@ -144,7 +144,10 @@ pub fn decide(
 
         let (decision, goal) = if cond.morale < BROKEN {
             // Morale broke: fall back toward the King, looking for cover.
-            let king = kings.iter().find(|(f, _)| **f == *faction).map(|(_, p)| *p);
+            let king = kings
+                .iter()
+                .find(|(u, f, _)| u.class == super::UnitClass::King && **f == *faction)
+                .map(|(_, _, p)| *p);
             let home = king.unwrap_or(*pos);
             let dir = Vec2::new((home.x - pos.x) as f32, (home.y - pos.y) as f32).normalize_or_zero() * 10.0;
             let fallback = pos.offset(dir.x.round() as i32, dir.y.round() as i32);

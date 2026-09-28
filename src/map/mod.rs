@@ -96,6 +96,9 @@ pub enum Feature {
     /// Ruined building wall or concrete barrier. Solid like rock; Tanks and
     /// Explosive will be able to break it (later).
     Wall,
+    /// A parked (or wrecked) troop vehicle. Appears during battle when a
+    /// vehicle deployment reaches its spot. Solid like rock.
+    Vehicle,
 }
 
 impl Feature {
@@ -106,12 +109,13 @@ impl Feature {
             Feature::LightCover => "Sandbags",
             Feature::Rock => "Rock",
             Feature::Wall => "Wall",
+            Feature::Vehicle => "Parked vehicle",
         }
     }
 
     /// Solid obstacles can't be walked through and block line of sight.
     pub fn is_solid(self) -> bool {
-        matches!(self, Feature::Rock | Feature::Wall)
+        matches!(self, Feature::Rock | Feature::Wall | Feature::Vehicle)
     }
 }
 
@@ -150,7 +154,7 @@ impl Tile {
         match self.feature {
             Feature::None => 1,
             Feature::Trees | Feature::LightCover => 2,
-            Feature::Rock | Feature::Wall => u32::MAX / 64,
+            Feature::Rock | Feature::Wall | Feature::Vehicle => u32::MAX / 64,
         }
     }
 
@@ -234,6 +238,9 @@ pub struct GameMap {
     pub sectors: Vec<Sector>,
     /// Starting King position per faction, indexed by `Faction::index()`.
     pub spawns: [TilePos; 2],
+    /// Bumped whenever terrain changes during a match (e.g. a vehicle
+    /// parks), so cached line-of-sight gets recomputed.
+    pub version: u32,
 }
 
 impl GameMap {
@@ -247,6 +254,14 @@ impl GameMap {
 
     pub fn tile_mut(&mut self, pos: TilePos) -> &mut Tile {
         &mut self.tiles[Self::idx(pos)]
+    }
+
+    /// Is this tile on the given side's half of the map?
+    pub fn in_home_half(&self, faction: Faction, pos: TilePos) -> bool {
+        match faction {
+            Faction::Humans => pos.y < MAP_H / 2,
+            Faction::Termbots => pos.y >= MAP_H / 2,
+        }
     }
 
     pub fn spawn(&self, faction: Faction) -> TilePos {

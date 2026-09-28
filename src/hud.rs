@@ -14,6 +14,8 @@ use crate::input::CursorWorld;
 use crate::map::{self, GameMap, TilePos};
 use crate::sim::classes::Traits;
 use crate::sim::combat::MatchOutcome;
+use crate::sim::economy::{MatchPhase, Territory, seconds_left};
+use crate::sim::vehicle::Vehicle;
 use crate::sim::fighter::{Condition, Fighter, Health, statuses};
 use crate::sim::platoon::Platoon;
 use crate::sim::{Mover, SimTick, Unit, UnitClass};
@@ -49,6 +51,7 @@ fn spawn_hud(mut commands: Commands) {
             ..default()
         },
         BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.65)),
+        Interaction::default(),
         children![(HudText, Text::new(""), TextFont::from_font_size(13.0), TextColor(Color::WHITE))],
     ));
     commands.spawn((
@@ -82,26 +85,36 @@ fn update_hud(
     local: Res<LocalPlayer>,
     time: Res<Time<Virtual>>,
     cursor: Res<CursorWorld>,
+    phase: Res<MatchPhase>,
+    territory: Res<Territory>,
     units: Query<(&Faction, Option<&Fighter>)>,
     mut text: Single<&mut Text, With<HudText>>,
 ) {
-    let seconds = tick.0 as f64 / crate::sim::SIM_HZ;
+    let enemy = match local.0 {
+        Faction::Humans => Faction::Termbots,
+        Faction::Termbots => Faction::Humans,
+    };
     let count = |f: Faction| units.iter().filter(|(uf, fi)| **uf == f && fi.is_some()).count();
     let mut lines = vec![
-        format!("TERMBOTS vs HUMANS  -  prototype step 2   (you: {})", local.0.name()),
+        format!("TERMBOTS vs HUMANS  -  prototype step 4   (you: {})", local.0.name()),
+        if phase.battle {
+            let left = seconds_left(tick.0);
+            format!(
+                "Time left {:02}:{:02}   Sectors held: you {}, enemy {}{}",
+                left / 60,
+                left % 60,
+                territory.held(local.0),
+                territory.held(enemy),
+                if time.is_paused() { "   [PAUSED]" } else { "" }
+            )
+        } else {
+            format!("SETUP: place your army, then START BATTLE   (map seed {})", map.seed)
+        },
         format!(
-            "Map seed {}   Time {:02}:{:02}{}",
-            map.seed,
-            (seconds / 60.0) as u32,
-            (seconds % 60.0) as u32,
-            if time.is_paused() { "   [PAUSED]" } else { "" }
-        ),
-        format!(
-            "Map explored: {:.0}%{}   Fighters: {} Humans, {} Termbots",
+            "Map explored: {:.0}%{}   Your fighters: {}",
             fog.explored_fraction(local.0) * 100.0,
             if fog_debug.show_all { " (fog hidden)" } else { "" },
-            count(Faction::Humans),
-            count(Faction::Termbots),
+            count(local.0),
         ),
     ];
 
@@ -124,6 +137,7 @@ fn update_hud(
     }
 
     lines.push(String::new());
+    lines.push("Army panel (right): build a platoon, then click the map".into());
     lines.push("Left-click a fighter: select its platoon".into());
     lines.push("1/2/3 or buttons: mission   Right-click: target".into());
     lines.push("Hover a fighter for details".into());
@@ -143,6 +157,7 @@ type HoverQuery<'a> = (
     Option<&'a Fighter>,
     Option<&'a Traits>,
     Option<&'a Condition>,
+    Option<&'a Vehicle>,
 );
 
 #[allow(clippy::too_many_arguments)]
@@ -168,7 +183,7 @@ fn update_tooltip(
             .map(|(_, u)| u)
     });
     let (node, visibility) = &mut *tooltip;
-    let Some((entity, unit, faction, pos, _, health, mover, fighter, traits, cond)) = hovered else {
+    let Some((entity, unit, faction, pos, _, health, mover, fighter, traits, cond, vehicle)) = hovered else {
         **visibility = Visibility::Hidden;
         return;
     };
@@ -179,6 +194,15 @@ fn update_tooltip(
 
     if unit.class == UnitClass::King {
         lines.push(format!("Health {:.0}/{:.0}", health.current.max(0.0), health.max));
+    } else if let Some(v) = vehicle {
+        lines.push(format!("Health {:.0}/{:.0}  (armored)", health.current.max(0.0), health.max));
+        if own {
+            let names: Vec<&str> = v.cargo.iter().map(|r| r.class.stats().name).collect();
+            lines.push(format!("Carrying: {}", names.join(", ")));
+            lines.push(format!("Drop-off: ({}, {})", v.destination.x, v.destination.y));
+        } else {
+            lines.push("Carrying an unknown platoon".into());
+        }
     } else if own {
         if let Some(p) = platoon {
             let leader = if p.leader == Some(entity) { "  (Leader)" } else { "" };
@@ -231,18 +255,19 @@ fn update_banner(
     mut texts: Query<&mut Text, Without<HudText>>,
 ) {
     let (visibility, children) = &mut *banner;
-    let Some(winner) = outcome.and_then(|o| o.winner) else {
+    let Some(outcome) = outcome.filter(|o| o.ended) else {
         **visibility = Visibility::Hidden;
         return;
     };
     **visibility = Visibility::Inherited;
+    let headline = match outcome.winner {
+        Some(w) if w == local.0 => "VICTORY",
+        Some(_) => "DEFEAT",
+        None => "DRAW",
+    };
     for child in children.iter() {
         if let Ok(mut t) = texts.get_mut(child) {
-            t.0 = if winner == local.0 {
-                "VICTORY - the enemy King is down (N: new map)".into()
-            } else {
-                "DEFEAT - your King is down (N: new map)".into()
-            };
+            t.0 = format!("{headline}\n{}\n(N: new map)", outcome.reason);
         }
     }
 }

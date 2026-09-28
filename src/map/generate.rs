@@ -61,6 +61,7 @@ pub fn try_generate(seed: u64) -> Result<GameMap, GenError> {
         tiles: vec![Tile::default(); TILE_COUNT],
         sectors: build_sectors(),
         spawns,
+        version: 0,
     };
 
     generate_elevation(&mut map, &mut rng);
