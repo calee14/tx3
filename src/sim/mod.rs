@@ -15,6 +15,9 @@ pub mod classes;
 pub mod combat;
 pub mod economy;
 pub mod fighter;
+pub mod gadgets;
+#[cfg(test)]
+mod gadget_tests;
 pub mod perception;
 pub mod platoon;
 pub mod vehicle;
@@ -26,7 +29,7 @@ use rand_chacha::ChaCha8Rng;
 
 use crate::faction::Faction;
 use crate::map::{GameMap, TilePos};
-use crate::pathfinding::find_path;
+use crate::pathfinding::find_path_avoiding;
 use classes::FighterClass;
 use combat::{MatchOutcome, ShotLog};
 use platoon::{Mission, Platoon, PlatoonId};
@@ -43,6 +46,11 @@ impl Plugin for SimPlugin {
         app.insert_resource(Time::<Fixed>::from_hz(SIM_HZ))
             .init_resource::<ShotLog>()
             .init_resource::<platoon::SignalsInFlight>()
+            .init_resource::<gadgets::KnownTraps>()
+            .init_resource::<gadgets::AirSupport>()
+            .init_resource::<gadgets::PendingExplosions>()
+            .init_resource::<gadgets::BlastLog>()
+            .init_resource::<fighter::XpLog>()
             .configure_sets(
                 FixedUpdate,
                 (
@@ -74,17 +82,35 @@ impl Plugin for SimPlugin {
                         advance_tick,
                         economy::accrue_supply,
                         process_commands,
+                        gadgets::process_gadget_commands,
                         platoon::deliver_signals,
                         economy::process_deployments,
                     )
                         .chain()
                         .in_set(SimSet::Commands),
                     platoon::update_platoons.in_set(SimSet::Platoons),
-                    perception::update_perception.in_set(SimSet::Perception),
-                    ai::decide.in_set(SimSet::Decide),
+                    (perception::update_perception, gadgets::detect_gadgets).chain().in_set(SimSet::Perception),
+                    (ai::decide, gadgets::update_engineers).chain().in_set(SimSet::Decide),
                     move_units.in_set(SimSet::Movement),
-                    combat::fire_weapons.in_set(SimSet::Combat),
-                    (combat::update_conditions, combat::remove_dead).chain().in_set(SimSet::Aftermath),
+                    (
+                        gadgets::resolve_strikes,
+                        gadgets::trigger_traps,
+                        combat::fire_weapons,
+                        gadgets::fire_turrets,
+                        gadgets::fire_artillery,
+                        gadgets::use_abilities,
+                    )
+                        .chain()
+                        .in_set(SimSet::Combat),
+                    (
+                        gadgets::resolve_explosions,
+                        fighter::apply_experience,
+                        gadgets::update_smoke,
+                        combat::update_conditions,
+                        combat::remove_dead,
+                    )
+                        .chain()
+                        .in_set(SimSet::Aftermath),
                     vehicle::update_vehicles.in_set(SimSet::Vehicles),
                     (economy::update_territory, economy::check_timer).chain().in_set(SimSet::Territory),
                     record_interpolation.in_set(SimSet::Record),
@@ -187,6 +213,17 @@ pub enum SimCommand {
     /// Battle: buy a platoon (1-5 fighters) and send it to an explored
     /// tile, on foot from base or by vehicle (costs more).
     Deploy { issuer: Faction, classes: Vec<FighterClass>, vehicle: bool, target: TilePos },
+    /// Setup only: place a gadget (mine, bomb, turret, artillery) in your
+    /// half. Paid for like a platoon; undo takes it back.
+    PlaceGadget { issuer: Faction, kind: gadgets::GadgetKind, at: TilePos },
+    /// Battle: signal a platoon's engineer to build a gadget at an explored
+    /// tile. Paid when sent; refunded if the build is abandoned.
+    Build { issuer: Faction, platoon: PlatoonId, kind: gadgets::GadgetKind, target: TilePos },
+    /// Battle: call an air strike on an explored tile (costly, long
+    /// cooldown, 4 s warning).
+    AirStrike { issuer: Faction, target: TilePos },
+    /// Battle: order an artillery piece to shell a tile next.
+    ArtilleryFire { issuer: Faction, unit: UnitId, target: TilePos },
 }
 
 /// Commands waiting for the next tick. Commands issued while the game is
@@ -217,6 +254,8 @@ pub enum UnitClass {
     Fighter(FighterClass),
     /// A troop transport on its way to a drop-off.
     Vehicle,
+    /// A mine, bomb, turret or artillery piece built by engineers.
+    Gadget(gadgets::GadgetKind),
 }
 
 impl UnitClass {
@@ -225,6 +264,7 @@ impl UnitClass {
             UnitClass::King => "King",
             UnitClass::Fighter(class) => class.stats().name,
             UnitClass::Vehicle => "Troop vehicle",
+            UnitClass::Gadget(kind) => kind.stats().name,
         }
     }
 
@@ -233,6 +273,7 @@ impl UnitClass {
             UnitClass::King => "K",
             UnitClass::Fighter(class) => class.stats().letter,
             UnitClass::Vehicle => "V",
+            UnitClass::Gadget(kind) => kind.stats().letter,
         }
     }
 }
@@ -275,9 +316,20 @@ impl Mover {
 /// Plan a path to `goal`. If the unit is mid-step, it finishes that step
 /// first and plans from the tile it's stepping into.
 pub fn set_destination(map: &GameMap, pos: TilePos, mover: &mut Mover, goal: TilePos) -> bool {
+    set_destination_avoiding(map, pos, mover, goal, &std::collections::HashSet::new())
+}
+
+/// Like `set_destination`, stepping around the `avoid` tiles (known traps).
+pub fn set_destination_avoiding(
+    map: &GameMap,
+    pos: TilePos,
+    mover: &mut Mover,
+    goal: TilePos,
+    avoid: &std::collections::HashSet<TilePos>,
+) -> bool {
     let mid_step = mover.progress > 0.0 && !mover.path.is_empty();
     let start = if mid_step { mover.path[0] } else { pos };
-    match find_path(map, start, goal) {
+    match find_path_avoiding(map, start, goal, avoid) {
         Some(mut path) => {
             if mid_step {
                 path.push_front(start);
@@ -350,6 +402,7 @@ pub fn process_commands(
                     from,
                     sent_tick: tick.0,
                     arrive_tick: tick.0 + platoon::SIGNAL_TRAVEL_TICKS,
+                    build: None,
                 });
             }
             _ => {}

@@ -4,11 +4,16 @@
 //! Giving a signal: left-click any fighter to select its platoon, pick a
 //! mission (buttons at the bottom, or keys 1 / 2 / 3), then right-click
 //! the target. Right-clicking without picking a mission keeps the
-//! platoon's current mission with a new target. Signals take 0.5 s to
+//! platoon's current mission with a new target. Signals take 1 s to
 //! reach the platoon, and every signal adds a little confusion, so don't
 //! spam.
 //!
-//! The King is selected and moved the same way, without missions.
+//! Platoons with an engineer can also be told to build (buttons, or keys
+//! 4-7: mine, bomb, turret, artillery), then right-click the site. The
+//! build order travels like any other signal and is paid when sent.
+//!
+//! The King is selected and moved the same way, without missions. Your
+//! artillery can be selected too: right-click an explored tile to shell it.
 
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
@@ -21,7 +26,11 @@ use crate::fog::FogOfWar;
 use crate::map::GameMap;
 use crate::sim::economy::MatchPhase;
 use crate::sim::SimTick;
-use crate::sim::fighter::Fighter;
+use crate::sim::classes::FighterClass;
+use crate::sim::fighter::{Condition, Fighter, WorkKind};
+use crate::sim::gadgets::{
+    AIR_STRIKE_RADIUS, ARTILLERY_RADIUS, ARTILLERY_RANGE, Gadget, GadgetKind, air_strike_impacts,
+};
 use crate::sim::platoon::{SIGNAL_TRAVEL_TICKS, SignalsInFlight};
 use crate::sim::platoon::{Mission, Platoon};
 use crate::sim::{CommandQueue, Mover, SimCommand, Unit, UnitClass};
@@ -35,6 +44,7 @@ impl Plugin for InputPlugin {
         app.init_resource::<CursorWorld>()
             .init_resource::<Selection>()
             .init_resource::<PendingMission>()
+            .init_resource::<PendingBuild>()
             .add_systems(Startup, spawn_orders_panel)
             .add_systems(
                 Update,
@@ -42,6 +52,7 @@ impl Plugin for InputPlugin {
                     update_cursor,
                     (
                         mission_buttons,
+                        build_buttons,
                         mission_hotkeys,
                         select_and_command,
                         draw_selection,
@@ -82,14 +93,29 @@ pub enum Selection {
     None,
     King(Entity),
     Platoon(Entity),
+    Artillery(Entity),
 }
 
 /// Mission chosen for the next right-click signal.
 #[derive(Resource, Default)]
 pub struct PendingMission(pub Option<Mission>);
 
+/// Gadget chosen for the next right-click build order.
+#[derive(Resource, Default)]
+pub struct PendingBuild(pub Option<GadgetKind>);
+
 #[derive(Component)]
 struct MissionButton(Mission);
+
+#[derive(Component)]
+struct BuildButton(GadgetKind);
+
+#[derive(Component)]
+struct MissionRow;
+
+/// The row of build buttons (shown when the platoon has an engineer).
+#[derive(Component)]
+struct BuildRow;
 
 #[derive(Component)]
 struct OrdersText;
@@ -126,8 +152,8 @@ fn spawn_orders_panel(mut commands: Commands) {
             position_type: PositionType::Absolute,
             bottom: Val::Px(10.0),
             left: Val::Percent(50.0),
-            margin: UiRect::left(Val::Px(-330.0)),
-            width: Val::Px(660.0),
+            margin: UiRect::left(Val::Px(-370.0)),
+            width: Val::Px(740.0),
             flex_direction: FlexDirection::Column,
             align_items: AlignItems::Center,
             padding: UiRect::all(Val::Px(8.0)),
@@ -139,24 +165,52 @@ fn spawn_orders_panel(mut commands: Commands) {
         children![
             (OrdersText, Text::new(""), TextFont::from_font_size(14.0), TextColor(Color::WHITE)),
             (
+                MissionRow,
                 Node { margin: UiRect::top(Val::Px(6.0)), ..default() },
                 children![
                     button(Mission::Assault, "1"),
                     button(Mission::Overwatch, "2"),
                     button(Mission::Reposition, "3"),
                 ]
+            ),
+            (
+                BuildRow,
+                Node { margin: UiRect::top(Val::Px(6.0)), ..default() },
+                children![
+                    build_button(GadgetKind::Mine, "4"),
+                    build_button(GadgetKind::Bomb, "5"),
+                    build_button(GadgetKind::Turret, "6"),
+                    build_button(GadgetKind::Artillery, "7"),
+                ]
             )
         ],
     ));
 }
 
-fn mission_buttons(
-    mut pending: ResMut<PendingMission>,
-    mut buttons: Query<(&Interaction, &MissionButton, &mut BackgroundColor)>,
+fn build_button(kind: GadgetKind, key: &str) -> impl Bundle {
+    let s = kind.stats();
+    (
+        Button,
+        BuildButton(kind),
+        Node { padding: UiRect::axes(Val::Px(10.0), Val::Px(5.0)), margin: UiRect::horizontal(Val::Px(4.0)), ..default() },
+        BackgroundColor(Color::srgb(0.2, 0.2, 0.24)),
+        children![(
+            Text::new(format!("{key}  Build {} {:.0}", s.name, s.cost)),
+            TextFont::from_font_size(13.0),
+            TextColor(Color::WHITE)
+        )],
+    )
+}
+
+fn build_buttons(
+    mut pending: ResMut<PendingBuild>,
+    mut mission: ResMut<PendingMission>,
+    mut buttons: Query<(&Interaction, &BuildButton, &mut BackgroundColor)>,
 ) {
     for (interaction, button, mut bg) in &mut buttons {
         if *interaction == Interaction::Pressed {
             pending.0 = Some(button.0);
+            mission.0 = None;
         }
         let chosen = pending.0 == Some(button.0);
         bg.0 = match (chosen, interaction) {
@@ -167,13 +221,49 @@ fn mission_buttons(
     }
 }
 
-fn mission_hotkeys(keys: Res<ButtonInput<KeyCode>>, selection: Res<Selection>, mut pending: ResMut<PendingMission>) {
+fn mission_buttons(
+    mut pending: ResMut<PendingMission>,
+    mut build: ResMut<PendingBuild>,
+    mut buttons: Query<(&Interaction, &MissionButton, &mut BackgroundColor)>,
+) {
+    for (interaction, button, mut bg) in &mut buttons {
+        if *interaction == Interaction::Pressed {
+            pending.0 = Some(button.0);
+            build.0 = None;
+        }
+        let chosen = pending.0 == Some(button.0);
+        bg.0 = match (chosen, interaction) {
+            (true, _) => Color::srgb(0.75, 0.6, 0.15),
+            (false, Interaction::Hovered) => Color::srgb(0.32, 0.32, 0.38),
+            _ => Color::srgb(0.2, 0.2, 0.24),
+        };
+    }
+}
+
+fn mission_hotkeys(
+    keys: Res<ButtonInput<KeyCode>>,
+    selection: Res<Selection>,
+    mut pending: ResMut<PendingMission>,
+    mut build: ResMut<PendingBuild>,
+) {
     if !matches!(*selection, Selection::Platoon(_)) {
         return;
     }
     for (key, mission) in [(KeyCode::Digit1, Mission::Assault), (KeyCode::Digit2, Mission::Overwatch), (KeyCode::Digit3, Mission::Reposition)] {
         if keys.just_pressed(key) {
             pending.0 = Some(mission);
+            build.0 = None;
+        }
+    }
+    for (key, kind) in [
+        (KeyCode::Digit4, GadgetKind::Mine),
+        (KeyCode::Digit5, GadgetKind::Bomb),
+        (KeyCode::Digit6, GadgetKind::Turret),
+        (KeyCode::Digit7, GadgetKind::Artillery),
+    ] {
+        if keys.just_pressed(key) {
+            build.0 = Some(kind);
+            pending.0 = None;
         }
     }
 }
@@ -187,6 +277,7 @@ fn select_and_command(
     mut builder: ResMut<ArmyBuilder>,
     mut selection: ResMut<Selection>,
     mut pending: ResMut<PendingMission>,
+    mut build: ResMut<PendingBuild>,
     mut queue: ResMut<CommandQueue>,
     units: Query<(Entity, &Unit, &Faction, &Transform, Option<&Fighter>)>,
     platoons: Query<&Platoon>,
@@ -196,19 +287,28 @@ fn select_and_command(
     }
     let Some(world) = cursor.world else { return };
 
-    // A platoon is being built in the army panel: clicks place / deploy it.
-    if !builder.is_empty() {
+    // Placing something from the army panel: a platoon, a gadget (setup)
+    // or an air strike (battle).
+    if builder.placing() {
         if buttons.just_pressed(MouseButton::Right) {
-            builder.classes.clear();
+            builder.cancel();
         } else if buttons.just_pressed(MouseButton::Left)
             && let Some(tile) = TilePos::from_world(world)
         {
-            let classes = std::mem::take(&mut builder.classes);
-            queue.push(if phase.battle {
-                SimCommand::Deploy { issuer: local.0, classes, vehicle: builder.vehicle, target: tile }
+            if let Some(kind) = builder.gadget {
+                // Stay in gadget mode, so several can be placed in a row.
+                queue.push(SimCommand::PlaceGadget { issuer: local.0, kind, at: tile });
+            } else if builder.air_strike {
+                builder.air_strike = false;
+                queue.push(SimCommand::AirStrike { issuer: local.0, target: tile });
             } else {
-                SimCommand::PlacePlatoon { issuer: local.0, classes, anchor: tile }
-            });
+                let classes = std::mem::take(&mut builder.classes);
+                queue.push(if phase.battle {
+                    SimCommand::Deploy { issuer: local.0, classes, vehicle: builder.vehicle, target: tile }
+                } else {
+                    SimCommand::PlacePlatoon { issuer: local.0, classes, anchor: tile }
+                });
+            }
         }
         return;
     }
@@ -219,17 +319,22 @@ fn select_and_command(
     if buttons.just_pressed(MouseButton::Left) {
         let clicked = units
             .iter()
-            .filter(|(_, _, faction, _, _)| **faction == local.0)
+            .filter(|(_, u, faction, _, _)| {
+                **faction == local.0
+                    && !matches!(u.class, UnitClass::Gadget(k) if k != GadgetKind::Artillery)
+            })
             .map(|(e, u, _, t, f)| (e, u, f, t.translation.truncate().distance(world)))
             .filter(|&(_, _, _, d)| d <= SELECT_RADIUS)
             .min_by(|a, b| a.3.total_cmp(&b.3));
         let new = match clicked {
             Some((e, unit, _, _)) if unit.class == UnitClass::King => Selection::King(e),
+            Some((e, unit, _, _)) if unit.class == UnitClass::Gadget(GadgetKind::Artillery) => Selection::Artillery(e),
             Some((_, _, Some(fighter), _)) => Selection::Platoon(fighter.platoon),
             _ => Selection::None,
         };
         if new != *selection {
             pending.0 = None;
+            build.0 = None;
         }
         *selection = new;
     }
@@ -244,9 +349,18 @@ fn select_and_command(
             }
             Selection::Platoon(e) => {
                 if let Ok(platoon) = platoons.get(e) {
-                    let mission = pending.0.unwrap_or(platoon.pending.map_or(platoon.mission, |p| p.mission));
-                    queue.push(SimCommand::Signal { issuer: local.0, platoon: platoon.id, mission, target });
+                    if let Some(kind) = build.0.take() {
+                        queue.push(SimCommand::Build { issuer: local.0, platoon: platoon.id, kind, target });
+                    } else {
+                        let mission = pending.0.unwrap_or(platoon.pending.map_or(platoon.mission, |p| p.mission));
+                        queue.push(SimCommand::Signal { issuer: local.0, platoon: platoon.id, mission, target });
+                    }
                     pending.0 = None;
+                }
+            }
+            Selection::Artillery(e) => {
+                if let Ok((_, unit, _, _, _)) = units.get(e) {
+                    queue.push(SimCommand::ArtilleryFire { issuer: local.0, unit: unit.id, target });
                 }
             }
             Selection::None => {}
@@ -257,12 +371,25 @@ fn select_and_command(
 fn draw_selection(
     mut selection: ResMut<Selection>,
     units: Query<(&Transform, &Mover)>,
+    guns: Query<&Gadget>,
     platoons: Query<&Platoon>,
     mut gizmos: Gizmos,
 ) {
     let yellow = Color::srgb(1.0, 0.95, 0.3);
     match *selection {
         Selection::None => {}
+        Selection::Artillery(e) => {
+            let (Ok((transform, _)), Ok(gun)) = (units.get(e), guns.get(e)) else {
+                *selection = Selection::None; // destroyed
+                return;
+            };
+            let here = transform.translation.truncate();
+            gizmos.circle_2d(Isometry2d::from_translation(here), 12.0, yellow);
+            gizmos.circle_2d(Isometry2d::from_translation(here), ARTILLERY_RANGE * TILE_SIZE, yellow.with_alpha(0.25));
+            if let Some(aim) = gun.aim {
+                gizmos.circle_2d(Isometry2d::from_translation(aim.to_world()), ARTILLERY_RADIUS * TILE_SIZE, yellow.with_alpha(0.7));
+            }
+        }
         Selection::King(e) => {
             let Ok((transform, mover)) = units.get(e) else {
                 *selection = Selection::None;
@@ -305,25 +432,52 @@ fn draw_selection(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_orders_panel(
     phase: Res<MatchPhase>,
     flight: Res<SignalsInFlight>,
     selection: Res<Selection>,
     pending: Res<PendingMission>,
+    build: Res<PendingBuild>,
     platoons: Query<&Platoon>,
-    mut panel: Single<&mut Node, With<OrdersPanel>>,
+    fighters: Query<(&Fighter, &Condition)>,
+    guns: Query<&Gadget>,
+    mut panel: Single<&mut Node, (With<OrdersPanel>, Without<BuildRow>, Without<MissionRow>)>,
+    mut build_row: Single<&mut Node, (With<BuildRow>, Without<OrdersPanel>, Without<MissionRow>)>,
+    mut mission_row: Single<&mut Node, (With<MissionRow>, Without<OrdersPanel>, Without<BuildRow>)>,
     mut text: Single<&mut Text, With<OrdersText>>,
 ) {
-    let Selection::Platoon(e) = *selection else {
-        panel.display = Display::None;
-        return;
-    };
     if !phase.battle {
         panel.display = Display::None;
         return;
     }
+    if let Selection::Artillery(e) = *selection {
+        let Ok(gun) = guns.get(e) else { return };
+        panel.display = Display::Flex;
+        build_row.display = Display::None;
+        mission_row.display = Display::None;
+        let state = if gun.cooldown > 0.0 { format!("reloading ({:.0} s)", gun.cooldown) } else { "ready".into() };
+        text.0 = format!(
+            "Artillery  |  {state}\nRight-click an explored tile within range to shell it next.\n\
+             Left alone, it shells the biggest enemy group your side can see."
+        );
+        return;
+    }
+    let Selection::Platoon(e) = *selection else {
+        panel.display = Display::None;
+        return;
+    };
     let Ok(platoon) = platoons.get(e) else { return };
     panel.display = Display::Flex;
+    mission_row.display = Display::Flex;
+    let engineers: Vec<&Condition> = platoon
+        .members
+        .iter()
+        .filter_map(|m| fighters.get(*m).ok())
+        .filter(|(f, _)| f.class == FighterClass::Engineer)
+        .map(|(_, c)| c)
+        .collect();
+    build_row.display = if engineers.is_empty() { Display::None } else { Display::Flex };
     let mut line = format!(
         "{}  |  {} fighters  |  Mission: {}  |  Confusion: {:.0} ({})",
         platoon.name,
@@ -333,13 +487,26 @@ fn update_orders_panel(
         platoon.confusion_label()
     );
     if let Some(s) = flight.heading_to(e) {
-        line.push_str(&format!("\nSignal on its way: {}", s.mission.name()));
+        match s.build {
+            Some((kind, _)) => line.push_str(&format!("\nBuild order on its way: {}", kind.stats().name)),
+            None => line.push_str(&format!("\nSignal on its way: {}", s.mission.name())),
+        }
     } else if let Some(p) = platoon.pending {
         line.push_str(&format!("\nOrder received, not acted on yet: {}", p.mission.name()));
     }
-    line.push_str(&match pending.0 {
-        Some(m) => format!("\nRight-click a target to signal: {}", m.name()),
-        None => "\nPick a mission, then right-click a target".to_string(),
+    for c in &engineers {
+        if let Some(work) = c.work {
+            let what = match work.kind {
+                WorkKind::Build(kind) => format!("building a {}", kind.stats().name),
+                WorkKind::Defuse(_) => "defusing a trap".to_string(),
+            };
+            line.push_str(&format!("\nEngineer {what} ({:.0}%)", work.progress * 100.0));
+        }
+    }
+    line.push_str(&match (pending.0, build.0) {
+        (_, Some(k)) => format!("\nRight-click the site to build: {} ({:.0})", k.stats().name, k.stats().cost),
+        (Some(m), _) => format!("\nRight-click a target to signal: {}", m.name()),
+        _ => "\nPick a mission, then right-click a target".to_string(),
     });
     text.0 = line;
 }
@@ -375,6 +542,7 @@ fn draw_signals_in_flight(
 
 /// While a platoon is being built: show where it would go, green if the
 /// click would be accepted (your half in setup, explored ground in battle).
+#[allow(clippy::too_many_arguments)]
 fn draw_placement_preview(
     builder: Res<ArmyBuilder>,
     cursor: Res<CursorWorld>,
@@ -382,12 +550,39 @@ fn draw_placement_preview(
     local: Res<LocalPlayer>,
     map: Res<GameMap>,
     fog: Res<FogOfWar>,
+    build: Res<PendingBuild>,
+    kings: Query<(&Unit, &Faction, &TilePos)>,
     mut gizmos: Gizmos,
 ) {
-    if builder.is_empty() || cursor.over_ui {
+    if cursor.over_ui {
         return;
     }
     let Some(tile) = cursor.tile() else { return };
+    let good = Color::srgb(0.3, 1.0, 0.4);
+    let bad = Color::srgb(1.0, 0.3, 0.3);
+    // Engineer build site, or a setup gadget.
+    let gadget = build.0.filter(|_| phase.battle).or(builder.gadget.filter(|_| !phase.battle));
+    if let Some(kind) = gadget {
+        let ok = map.tile(tile).passable()
+            && if phase.battle { fog.is_explored(local.0, tile) } else { map.in_home_half(local.0, tile) };
+        let size = if kind.is_trap() { 8.0 } else { 14.0 };
+        gizmos.rect_2d(Isometry2d::from_translation(tile.to_world()), Vec2::splat(size), if ok { good } else { bad });
+        return;
+    }
+    if builder.air_strike {
+        let ok = fog.is_explored(local.0, tile);
+        let from = kings
+            .iter()
+            .find(|(u, f, _)| u.class == UnitClass::King && **f == local.0)
+            .map_or(tile, |(_, _, p)| *p);
+        for (p, _) in air_strike_impacts(from, tile, 0) {
+            gizmos.circle_2d(Isometry2d::from_translation(p.to_world()), AIR_STRIKE_RADIUS * TILE_SIZE, if ok { good } else { bad });
+        }
+        return;
+    }
+    if builder.is_empty() {
+        return;
+    }
     let ok = if phase.battle {
         fog.is_explored(local.0, tile) && map.tile(tile).passable()
     } else {

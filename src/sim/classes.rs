@@ -17,6 +17,175 @@ pub enum FighterClass {
     HeavyWeapons,
     /// Knight: armored breacher, short range, hard to scare.
     Juggernaut,
+    /// Builds mines, bombs, turrets and artillery; finds and defuses the
+    /// enemy's hidden traps.
+    Engineer,
+}
+
+/// What a weapon does best.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DamageType {
+    /// Plain bullets.
+    Standard,
+    /// Strong against light armor, weak against heavy.
+    Piercing,
+    /// Strong against heavy armor; blasts ignore cover and break walls.
+    Explosive,
+    /// Weaker hits, but pins targets down with heavy suppression.
+    Suppression,
+}
+
+impl DamageType {
+    pub fn name(self) -> &'static str {
+        match self {
+            DamageType::Standard => "Standard",
+            DamageType::Piercing => "Piercing",
+            DamageType::Explosive => "Explosive",
+            DamageType::Suppression => "Suppression",
+        }
+    }
+}
+
+/// How well protected a unit's body is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ArmorClass {
+    Light,
+    Medium,
+    Heavy,
+}
+
+impl ArmorClass {
+    pub fn name(self) -> &'static str {
+        match self {
+            ArmorClass::Light => "Light",
+            ArmorClass::Medium => "Medium",
+            ArmorClass::Heavy => "Heavy",
+        }
+    }
+}
+
+/// Damage multiplier for a damage type against an armor class.
+pub fn damage_multiplier(damage: DamageType, armor: ArmorClass) -> f32 {
+    use ArmorClass::*;
+    use DamageType::*;
+    match (damage, armor) {
+        (Standard, _) => 1.0,
+        (Piercing, Light) => 1.3,
+        (Piercing, Medium) => 1.0,
+        (Piercing, Heavy) => 0.8,
+        (Explosive, Light) => 0.9,
+        (Explosive, Medium) => 1.2,
+        (Explosive, Heavy) => 1.5,
+        (Suppression, _) => 0.8,
+    }
+}
+
+/// Extra suppression a damage type puts on targets.
+pub fn suppression_multiplier(damage: DamageType) -> f32 {
+    match damage {
+        DamageType::Suppression => 1.6,
+        DamageType::Explosive => 1.5,
+        _ => 1.0,
+    }
+}
+
+/// A fighter's hidden equipment, rolled when it's bought. The enemy only
+/// learns it when it's used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Loadout {
+    /// Assaulter: nothing special.
+    Rifle,
+    /// Assaulter: throws a grenade (Explosive, ignores cover) at dug-in
+    /// enemies within 5 tiles, every 20 s.
+    Grenades,
+    /// Assaulter: patches up itself or a hurt neighbor (+35 health), twice.
+    Medkit,
+    /// Sniper: armor-piercing rounds (Piercing damage).
+    PiercingRounds,
+    /// Sniper: pops smoke (blocks sight, radius 2, 8 s) when pinned in the
+    /// open, every 40 s.
+    SmokeKit,
+    /// Heavy Weapons: machine gun (Suppression damage).
+    MachineGun,
+    /// Heavy Weapons: fires rockets (Explosive) at armored targets and
+    /// structures, every 6 s; the machine gun fires slower.
+    Rockets,
+    /// Juggernaut: shotgun (Standard).
+    Shotgun,
+    /// Juggernaut: blows up the wall or rock an enemy is sheltering behind,
+    /// every 25 s.
+    BreachingCharge,
+    /// Engineer: builds and defuses 60% faster.
+    Toolkit,
+    /// Engineer: carries 2 mines and plants them on its own while holding.
+    MineLayer,
+}
+
+impl Loadout {
+    pub fn name(self) -> &'static str {
+        match self {
+            Loadout::Rifle => "Rifle",
+            Loadout::Grenades => "Grenades",
+            Loadout::Medkit => "Medkit",
+            Loadout::PiercingRounds => "Piercing rounds",
+            Loadout::SmokeKit => "Smoke kit",
+            Loadout::MachineGun => "Machine gun",
+            Loadout::Rockets => "Rockets",
+            Loadout::Shotgun => "Shotgun",
+            Loadout::BreachingCharge => "Breaching charge",
+            Loadout::Toolkit => "Toolkit",
+            Loadout::MineLayer => "Mine layer",
+        }
+    }
+
+    /// The variants a class can roll.
+    pub fn options(class: FighterClass) -> &'static [Loadout] {
+        match class {
+            FighterClass::Assaulter => &[Loadout::Rifle, Loadout::Grenades, Loadout::Medkit],
+            FighterClass::Sniper => &[Loadout::PiercingRounds, Loadout::SmokeKit],
+            FighterClass::HeavyWeapons => &[Loadout::MachineGun, Loadout::Rockets],
+            FighterClass::Juggernaut => &[Loadout::Shotgun, Loadout::BreachingCharge],
+            FighterClass::Engineer => &[Loadout::Toolkit, Loadout::MineLayer],
+        }
+    }
+
+    pub fn roll(class: FighterClass, rng: &mut impl Rng) -> Loadout {
+        let options = Loadout::options(class);
+        options[rng.random_range(0..options.len())]
+    }
+}
+
+/// A fighter's weapon damage type, which can depend on its loadout.
+pub fn weapon_damage_type(class: FighterClass, loadout: Loadout) -> DamageType {
+    match (class, loadout) {
+        (FighterClass::Sniper, Loadout::PiercingRounds) => DamageType::Piercing,
+        (FighterClass::HeavyWeapons, Loadout::MachineGun) => DamageType::Suppression,
+        _ => DamageType::Standard,
+    }
+}
+
+/// The equipment component: which loadout, and which sides know about it.
+#[derive(bevy::prelude::Component, Clone, Copy, Debug)]
+pub struct Equipment {
+    pub loadout: Loadout,
+    /// Per faction index: has that side seen it used?
+    pub known_to: [bool; 2],
+    /// Seconds until the special ability can be used again.
+    pub cooldown: f32,
+    /// Uses left, for limited abilities (medkit, mines).
+    pub charges: u8,
+}
+
+impl Equipment {
+    pub fn new(loadout: Loadout, owner_index: usize) -> Self {
+        let mut known_to = [false; 2];
+        known_to[owner_index] = true;
+        let charges = match loadout {
+            Loadout::Medkit | Loadout::MineLayer => 2,
+            _ => 0,
+        };
+        Self { loadout, known_to, cooldown: 0.0, charges }
+    }
 }
 
 /// Inclusive ranges that traits are rolled in, 0-100.
@@ -54,13 +223,18 @@ pub struct ClassStats {
     pub moving_accuracy: f32,
     /// Suppression each shot puts on its target (more if it hits).
     pub suppression: f32,
+    pub armor_class: ArmorClass,
     pub traits: TraitRanges,
 }
 
 impl FighterClass {
-    #[allow(dead_code)] // used by tests; handy for UI later
-    pub const ALL: [FighterClass; 4] =
-        [FighterClass::Assaulter, FighterClass::Sniper, FighterClass::HeavyWeapons, FighterClass::Juggernaut];
+    pub const ALL: [FighterClass; 5] = [
+        FighterClass::Assaulter,
+        FighterClass::Sniper,
+        FighterClass::HeavyWeapons,
+        FighterClass::Juggernaut,
+        FighterClass::Engineer,
+    ];
 
     pub fn stats(self) -> &'static ClassStats {
         match self {
@@ -68,6 +242,7 @@ impl FighterClass {
             FighterClass::Sniper => &SNIPER,
             FighterClass::HeavyWeapons => &HEAVY_WEAPONS,
             FighterClass::Juggernaut => &JUGGERNAUT,
+            FighterClass::Engineer => &ENGINEER,
         }
     }
 }
@@ -85,6 +260,7 @@ const ASSAULTER: ClassStats = ClassStats {
     base_accuracy: 0.55,
     moving_accuracy: 0.6,
     suppression: 6.0,
+    armor_class: ArmorClass::Light,
     traits: TraitRanges {
         accuracy: (35, 75),
         iq: (30, 70),
@@ -107,6 +283,7 @@ const SNIPER: ClassStats = ClassStats {
     base_accuracy: 0.8,
     moving_accuracy: 0.0,
     suppression: 10.0,
+    armor_class: ArmorClass::Light,
     traits: TraitRanges {
         accuracy: (65, 95),
         iq: (50, 90),
@@ -129,6 +306,7 @@ const HEAVY_WEAPONS: ClassStats = ClassStats {
     base_accuracy: 0.35,
     moving_accuracy: 0.3,
     suppression: 14.0,
+    armor_class: ArmorClass::Medium,
     traits: TraitRanges {
         accuracy: (30, 65),
         iq: (30, 65),
@@ -151,12 +329,36 @@ const JUGGERNAUT: ClassStats = ClassStats {
     base_accuracy: 0.6,
     moving_accuracy: 0.8,
     suppression: 8.0,
+    armor_class: ArmorClass::Heavy,
     traits: TraitRanges {
         accuracy: (35, 70),
         iq: (20, 55),
         tactics: (20, 60),
         bravery: (70, 100),
         leadership: (30, 70),
+    },
+};
+
+const ENGINEER: ClassStats = ClassStats {
+    name: "Engineer",
+    letter: "E",
+    max_health: 90.0,
+    armor: 0.0,
+    speed: 2.8,
+    vision: 11.0,
+    range: 6.0,
+    damage: 10.0,
+    fire_interval: 1.2,
+    base_accuracy: 0.5,
+    moving_accuracy: 0.6,
+    suppression: 5.0,
+    armor_class: ArmorClass::Light,
+    traits: TraitRanges {
+        accuracy: (30, 60),
+        iq: (55, 90),
+        tactics: (45, 85),
+        bravery: (30, 70),
+        leadership: (20, 60),
     },
 };
 
@@ -207,6 +409,30 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
+
+    #[test]
+    fn damage_types_beat_the_right_armor() {
+        use ArmorClass::*;
+        use DamageType::*;
+        assert!(damage_multiplier(Piercing, Light) > damage_multiplier(Piercing, Heavy));
+        assert!(damage_multiplier(Explosive, Heavy) > damage_multiplier(Explosive, Light));
+        assert!(damage_multiplier(Explosive, Heavy) > damage_multiplier(Standard, Heavy));
+        assert!(suppression_multiplier(Suppression) > suppression_multiplier(Standard));
+    }
+
+    #[test]
+    fn loadouts_roll_from_class_options() {
+        let mut rng = ChaCha8Rng::seed_from_u64(9);
+        for class in FighterClass::ALL {
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..60 {
+                let l = Loadout::roll(class, &mut rng);
+                assert!(Loadout::options(class).contains(&l));
+                seen.insert(l);
+            }
+            assert_eq!(seen.len(), Loadout::options(class).len(), "{class:?} rolls every option");
+        }
+    }
 
     #[test]
     fn traits_roll_within_class_ranges() {

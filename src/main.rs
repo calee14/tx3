@@ -1,11 +1,12 @@
 //! Termbots vs Humans: a real-time 2D strategy commander game.
 //!
-//! Steps 1-4 of the build order: a procedurally generated, balanced map,
+//! Steps 1-7 of the build order: a procedurally generated, balanced map,
 //! fog of war, and the fixed-timestep simulation; platoons of 1-5 fighters
 //! with rolled traits, missions, signals and confusion, and autonomous
 //! fighters; Supply, a hidden setup phase, reinforcements on foot or by
-//! vehicle, territory and the 15-minute timer; and the Termbot AI
-//! commander (step 7).
+//! vehicle, territory and the 15-minute timer; engineers, hidden traps,
+//! turrets, artillery and air strikes; loadouts, damage and armor types,
+//! destructible terrain and veterancy; and the Termbot AI commander.
 
 mod army_panel;
 mod camera;
@@ -48,6 +49,13 @@ fn main() {
             termbot::TermbotPlugin,
             army_panel::ArmyPanelPlugin,
         ))
-        .add_systems(Update, (map::render::draw_sector_borders, map::render::color_sector_labels))
+        .add_systems(
+            Update,
+            (
+                map::render::draw_sector_borders,
+                map::render::color_sector_labels,
+                map::render::repaint_changed_terrain.run_if(resource_exists::<map::GameMap>),
+            ),
+        )
         .run();
 }

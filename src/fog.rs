@@ -5,8 +5,8 @@
 //! - Fighters uncover the map as they move: any tile a fighter sees becomes
 //!   explored for its commander, permanently.
 //! - Enemy units on explored tiles are shown plainly (no silhouettes).
-//! - Hidden traps are NOT revealed by this; they need a fighter to detect
-//!   them directly (added with engineers in step 5).
+//! - Enemy gadgets are NOT revealed by this: traps, turrets and artillery
+//!   stay hidden until a fighter finds them (see `sim/gadgets.rs`).
 //!
 //! Fighters' own perception is separate (see `sim/perception.rs`): the fog
 //! never limits what units can see or react to.
@@ -19,6 +19,7 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use crate::faction::{Faction, LocalPlayer};
 use crate::game::MatchEntity;
 use crate::map::{GameMap, MAP_H, MAP_W, TILE_SIZE, TilePos};
+use crate::sim::gadgets::Concealed;
 use crate::sim::perception::Perception;
 use crate::sim::{SimSet, Unit};
 
@@ -166,10 +167,10 @@ fn update_enemy_visibility(
     fog: Res<FogOfWar>,
     debug: Res<FogDebug>,
     local: Res<LocalPlayer>,
-    mut units: Query<(&Faction, &TilePos, &mut Visibility), With<Unit>>,
+    mut units: Query<(&Faction, &TilePos, Option<&Concealed>, &mut Visibility), With<Unit>>,
 ) {
-    for (faction, pos, mut visibility) in &mut units {
-        let shown = *faction == local.0 || debug.show_all || fog.is_explored(local.0, *pos);
+    for (faction, pos, concealed, mut visibility) in &mut units {
+        let shown = crate::units::shown(&fog, &debug, *local, *faction, *pos, concealed);
         visibility.set_if_neq(if shown { Visibility::Inherited } else { Visibility::Hidden });
     }
 }

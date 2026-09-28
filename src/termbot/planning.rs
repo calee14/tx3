@@ -3,12 +3,14 @@
 
 use std::collections::HashSet;
 
+use bevy::math::Vec2;
 use rand::Rng;
 
 use crate::faction::Faction;
 use crate::map::{CoverLevel, GameMap, MAP_H, MAP_W, TilePos};
 use crate::sim::classes::FighterClass::{self, *};
 use crate::sim::economy::{ClassCounts, STARTING_SUPPLY, platoon_cost};
+use crate::sim::gadgets::GadgetKind;
 use crate::sim::platoon::nearest_free_tile_where;
 
 /// The enemy's opening view reaches about this many rows into our half;
@@ -44,6 +46,15 @@ impl Style {
         }
     }
 
+    /// Supply set aside for hidden gadgets during setup.
+    pub fn gadget_budget(self) -> f32 {
+        match self {
+            Style::Aggressive => 80.0,
+            Style::Balanced => 150.0,
+            Style::Defensive => 250.0,
+        }
+    }
+
     /// How far behind the middle line it likes to set up (rows).
     fn preferred_depth(self) -> f32 {
         match self {
@@ -56,22 +67,21 @@ impl Style {
     fn army(self) -> Vec<Vec<FighterClass>> {
         match self {
             Style::Aggressive => {
-                vec![vec![Juggernaut, Assaulter, Assaulter, Assaulter], vec![Juggernaut, Assaulter, Assaulter], vec![
-                    Assaulter,
-                    Assaulter,
-                    HeavyWeapons,
-                ]]
+                vec![
+                    vec![Juggernaut, Assaulter, Assaulter, Assaulter],
+                    vec![Juggernaut, Assaulter, Engineer],
+                    vec![Assaulter, Assaulter, HeavyWeapons],
+                ]
             }
             Style::Balanced => vec![
                 vec![Assaulter, Assaulter, Assaulter, HeavyWeapons],
-                vec![Sniper, Sniper, Assaulter],
+                vec![Sniper, Engineer, Assaulter],
                 vec![Juggernaut, Assaulter, Assaulter, HeavyWeapons],
             ],
             Style::Defensive => vec![
                 vec![Sniper, HeavyWeapons, Assaulter],
-                vec![Sniper, HeavyWeapons, Assaulter],
+                vec![Sniper, HeavyWeapons, Engineer],
                 vec![Assaulter, Assaulter, Assaulter, HeavyWeapons],
-                vec![Assaulter],
             ],
         }
     }
@@ -114,7 +124,7 @@ fn anchor_score(map: &GameMap, pos: TilePos, preferred_depth: f32, faction: Fact
 /// where to put them. Spots are chosen for cover and high ground, spread
 /// across the front, and deep enough to start out of the enemy's view.
 pub fn plan_setup(map: &GameMap, faction: Faction, style: Style, rng: &mut impl Rng) -> Vec<(Vec<FighterClass>, TilePos)> {
-    let mut budget = STARTING_SUPPLY;
+    let mut budget = STARTING_SUPPLY - style.gadget_budget();
     let mut counts = ClassCounts::default();
     let mut plan = Vec::new();
     let king = map.spawn(faction);
@@ -159,13 +169,106 @@ pub fn plan_setup(map: &GameMap, faction: Faction, style: Style, rng: &mut impl 
     plan
 }
 
-/// Enemy fighters seen right now, by class.
+/// Hidden gadgets for setup: traps on the likely approaches, and (for the
+/// careful styles) a turret guarding the King. Fits the style's budget.
+pub fn plan_gadgets(
+    map: &GameMap,
+    faction: Faction,
+    style: Style,
+    anchors: &[TilePos],
+    rng: &mut impl Rng,
+) -> Vec<(GadgetKind, TilePos)> {
+    use GadgetKind::*;
+    let kinds = match style {
+        Style::Aggressive => vec![Mine, Mine],
+        Style::Balanced => {
+            if rng.random_bool(0.5) {
+                vec![Turret]
+            } else {
+                vec![Bomb, Mine]
+            }
+        }
+        Style::Defensive => vec![Turret, Mine, Mine],
+    };
+    let king = map.spawn(faction);
+    let enemy = map.spawn(faction.opponent());
+    let mut chosen: Vec<TilePos> = Vec::new();
+    let mut plan = Vec::new();
+    let free = |p: TilePos, chosen: &[TilePos]| {
+        p.in_bounds()
+            && map.tile(p).passable()
+            && map.in_home_half(faction, p)
+            && chosen.iter().all(|c| c.distance(p) > 3.0)
+            && anchors.iter().all(|a| a.distance(p) > 6.0)
+    };
+    for (i, kind) in kinds.into_iter().enumerate() {
+        let center = if kind == Turret {
+            // In front of the King, toward the middle.
+            let toward = Vec2::new(0.0, if faction == Faction::Humans { 1.0 } else { -1.0 });
+            king.offset(0, (toward.y * 9.0) as i32)
+        } else {
+            // On the way from the enemy to one of our platoons, a few rows
+            // inside our half.
+            let a = anchors.get(i % anchors.len().max(1)).copied().unwrap_or(king);
+            let dir = Vec2::new((enemy.x - a.x) as f32, (enemy.y - a.y) as f32).normalize_or_zero();
+            let stop = rng.random_range(3..=6);
+            let mut p = a;
+            for step in 1..60 {
+                let q = a.offset((dir.x * step as f32).round() as i32, (dir.y * step as f32).round() as i32);
+                if !q.in_bounds() || depth(faction, q) < stop {
+                    break;
+                }
+                p = q;
+            }
+            p
+        };
+        let mut best: Option<(f32, TilePos)> = None;
+        for dy in -5..=5 {
+            for dx in -5..=5 {
+                let p = center.offset(dx, dy);
+                if !free(p, &chosen) {
+                    continue;
+                }
+                // Turrets want cover and height; traps want choke points
+                // (squeezed between obstacles).
+                let score = if kind == Turret {
+                    (map.cover_at(p) as u8) as f32 + map.tile(p).elevation as f32 * 0.8
+                } else {
+                    crate::map::DIRS8
+                        .iter()
+                        .filter(|(x, y)| {
+                            let n = p.offset(*x, *y);
+                            !n.in_bounds() || !map.tile(n).passable()
+                        })
+                        .count() as f32
+                        * 0.5
+                } - center.distance(p) * 0.15
+                    + rng.random_range(0.0..0.5);
+                if best.is_none_or(|(s, _)| score > s) {
+                    best = Some((score, p));
+                }
+            }
+        }
+        if let Some((_, p)) = best {
+            chosen.push(p);
+            plan.push((kind, p));
+        }
+    }
+    plan
+}
+
+/// Enemy fighters seen right now, by class, plus the enemy gadgets we
+/// know about.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KnownEnemy {
     pub assaulters: u32,
     pub snipers: u32,
     pub heavies: u32,
     pub juggernauts: u32,
+    /// Turrets and artillery found.
+    pub structures: u32,
+    /// Mines and bombs found.
+    pub traps: u32,
 }
 
 /// What to buy next: counter what the enemy has shown, else follow style.
@@ -174,6 +277,12 @@ pub fn reinforcement(style: Style, known: &KnownEnemy, supply: f32) -> Vec<Fight
     let mut classes = if known.snipers >= 2 {
         // Close the distance fast against snipers.
         vec![Juggernaut, Assaulter, Assaulter]
+    } else if known.structures >= 1 {
+        // Armor and firepower to crack turrets and artillery.
+        vec![Juggernaut, HeavyWeapons, Assaulter]
+    } else if known.traps >= 2 {
+        // Someone to clear the minefield.
+        vec![Engineer, Assaulter, Assaulter]
     } else if known.heavies + known.juggernauts >= 3 {
         // Pick heavy targets apart from range.
         vec![Sniper, HeavyWeapons, Assaulter]
@@ -228,7 +337,15 @@ mod tests {
                         counts.add(c);
                     }
                 }
-                assert!(spent <= STARTING_SUPPLY);
+                assert!(spent <= STARTING_SUPPLY - style.gadget_budget());
+                let anchors: Vec<TilePos> = plan.iter().map(|(_, a)| *a).collect();
+                let gadgets = plan_gadgets(&map, Faction::Termbots, style, &anchors, &mut rng);
+                assert!(!gadgets.is_empty());
+                let gadget_cost: f32 = gadgets.iter().map(|(k, _)| k.stats().cost).sum();
+                assert!(gadget_cost <= style.gadget_budget(), "{style:?} gadgets cost {gadget_cost}");
+                for (_, p) in &gadgets {
+                    assert!(map.in_home_half(Faction::Termbots, *p) && map.tile(*p).passable());
+                }
                 for (i, a) in plan.iter().enumerate() {
                     for b in &plan[i + 1..] {
                         assert!(a.1.distance(b.1) >= 14.0);
@@ -245,5 +362,7 @@ mod tests {
         let armor = KnownEnemy { juggernauts: 2, heavies: 1, ..Default::default() };
         assert!(reinforcement(Style::Aggressive, &armor, 300.0).contains(&Sniper));
         assert_eq!(reinforcement(Style::Balanced, &KnownEnemy::default(), 800.0).len(), 4);
+        let minefield = KnownEnemy { traps: 3, ..Default::default() };
+        assert!(reinforcement(Style::Balanced, &minefield, 300.0).contains(&Engineer));
     }
 }

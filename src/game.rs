@@ -191,6 +191,20 @@ mod tests {
                 }
             }
             eprintln!("-- t={}s {}", (step + 1) * 10, side_summary(&mut app));
+            if std::env::var("POSITIONS").is_ok() {
+                let world = app.world_mut();
+                let fog = world.resource::<crate::fog::FogOfWar>() as *const crate::fog::FogOfWar;
+                for (u, f, p) in world.query::<(&Unit, &Faction, &TilePos)>().iter(world) {
+                    if u.class == crate::sim::UnitClass::King {
+                        // SAFETY: read-only access to a resource while querying components.
+                        let seen = unsafe { &*fog }.is_explored(f.opponent(), *p);
+                        eprintln!("   {:?} King at {p:?} (enemy has explored it: {seen})", f);
+                    }
+                }
+                for (f, pl) in world.query::<(&Faction, &crate::sim::platoon::Platoon)>().iter(world) {
+                    eprintln!("   {:?} {} {} anchor {:?} target {:?}", f, pl.name, pl.mission.name(), pl.anchor, pl.target);
+                }
+            }
             let world = app.world_mut();
             world.resource_mut::<crate::termbot::AiCommanders>().brains.iter_mut().for_each(|b| b.log.clear());
             if world.resource::<crate::sim::combat::MatchOutcome>().ended {
@@ -212,6 +226,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ai_hides_gadgets_during_setup() {
+        use crate::sim::gadgets::{Concealed, Gadget};
+        let mut app = headless_ai_vs_ai(42);
+        run_ticks(&mut app, 2);
+        let world = app.world_mut();
+        let mut per_side = [0; 2];
+        for (f, _, c) in world.query::<(&Faction, &Gadget, &Concealed)>().iter(world) {
+            per_side[f.index()] += 1;
+            assert!(!c.known_to(f.opponent()), "setup gadgets start hidden from the enemy");
+        }
+        assert!(per_side[0] >= 1 && per_side[1] >= 1, "both commanders hid gadgets: {per_side:?}");
     }
 
     #[test]
@@ -245,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn signals_take_half_a_second_to_arrive() {
+    fn signals_take_a_second_to_arrive() {
         use crate::sim::platoon::{Mission, Platoon};
         let mut app = headless_app(42);
         run_ticks(&mut app, 2);
@@ -263,11 +291,11 @@ mod tests {
             target: TilePos::new(60, 40),
         });
         let mission = |app: &mut App| app.world().get::<Platoon>(entity).unwrap().mission;
-        run_ticks(&mut app, 9);
-        assert_eq!(mission(&mut app), Mission::Overwatch, "still on its way after 0.45 s");
+        run_ticks(&mut app, 19);
+        assert_eq!(mission(&mut app), Mission::Overwatch, "still on its way after 0.95 s");
         assert_eq!(app.world().get::<Platoon>(entity).unwrap().confusion, 0.0, "no confusion before it arrives");
         run_ticks(&mut app, 2);
-        assert_eq!(mission(&mut app), Mission::Assault, "received after 0.5 s");
+        assert_eq!(mission(&mut app), Mission::Assault, "received after 1 s");
     }
 
     /// Run ticks, returning the number of shots fired.

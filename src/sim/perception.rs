@@ -11,7 +11,8 @@ use bevy::prelude::*;
 use crate::faction::Faction;
 use crate::map::{Feature, GameMap, TilePos};
 
-use super::Unit;
+use super::gadgets::Concealed;
+use super::{Unit, UnitClass};
 
 /// Extra vision range per elevation level the viewer stands on.
 const HIGH_GROUND_BONUS: f32 = 2.0;
@@ -36,21 +37,35 @@ pub struct Perception {
     computed_at: Option<(TilePos, u32)>,
 }
 
+impl Perception {
+    /// Can this unit see the tile right now?
+    pub fn sees(&self, tile: TilePos) -> bool {
+        self.visible_set.contains(&tile)
+    }
+}
+
 /// Is there a clear line of sight from `from` to `to`?
 ///
 /// Blocked by any tile in between that is higher than the viewer (ledges
 /// block sight from below), by rocks and walls (except ones hugged by the
 /// viewer or target, which they can peek over), or by looking too deep
-/// into a forest. The
+/// into a forest, or by smoke (being in smoke, or looking at a tile in
+/// smoke, blocks sight too, unless the two are right next to each other). The
 /// target tile itself is always visible if the line reaches it, so a unit
 /// can see the edge of a plateau or the treeline.
 pub fn line_of_sight(map: &GameMap, from: TilePos, to: TilePos) -> bool {
     let viewer_elevation = map.tile(from).elevation;
     let mut trees = 0;
     let mut blocked = false;
+    if (map.smoky(to) || map.smoky(from)) && chebyshev(from, to) > 1 {
+        return false;
+    }
     for_each_line_tile(from, to, |p| {
         if p == from || p == to || blocked {
             return;
+        }
+        if map.smoky(p) {
+            blocked = true;
         }
         let tile = map.tile(p);
         if tile.elevation > viewer_elevation {
@@ -121,12 +136,20 @@ fn for_each_line_tile(a: TilePos, b: TilePos, mut f: impl FnMut(TilePos)) {
 pub fn update_perception(
     map: Res<GameMap>,
     mut viewers: Query<(&Faction, &TilePos, &Vision, &mut Perception)>,
-    targets: Query<(Entity, &Faction, &TilePos, &Unit)>,
+    targets: Query<(Entity, &Faction, &TilePos, &Unit, Option<&Concealed>)>,
 ) {
     // Stable order so fighters' target lists (and so their random rolls)
-    // are the same on every machine.
-    let mut all_targets: Vec<(Entity, Faction, TilePos, super::UnitId)> =
-        targets.iter().map(|(e, f, p, u)| (e, *f, *p, u.id)).collect();
+    // are the same on every machine. Traps are never targets; turrets and
+    // artillery only once found (see `gadgets.rs`).
+    let mut all_targets: Vec<(Entity, Faction, TilePos, super::UnitId)> = targets
+        .iter()
+        .filter(|(_, f, _, u, c)| match u.class {
+            UnitClass::Gadget(k) if k.is_trap() => false,
+            UnitClass::Gadget(_) => c.is_none_or(|c| c.known_to(f.opponent())),
+            _ => true,
+        })
+        .map(|(e, f, p, u, _)| (e, *f, *p, u.id))
+        .collect();
     all_targets.sort_by_key(|t| t.3);
 
     for (faction, pos, vision, mut perception) in &mut viewers {
@@ -211,6 +234,15 @@ mod tests {
         assert!(line_of_sight(&map, TilePos::new(10, 10), TilePos::new(18, 10)));
         // But a unit two tiles behind the wall is hidden.
         assert!(!line_of_sight(&map, TilePos::new(10, 10), TilePos::new(19, 10)));
+    }
+
+    #[test]
+    fn smoke_blocks_sight() {
+        let mut map = flat_map();
+        map.smoke.insert(TilePos::new(13, 10), 100);
+        assert!(!line_of_sight(&map, TilePos::new(10, 10), TilePos::new(16, 10)));
+        assert!(!line_of_sight(&map, TilePos::new(10, 10), TilePos::new(13, 10)), "hidden inside the smoke");
+        assert!(line_of_sight(&map, TilePos::new(12, 10), TilePos::new(13, 10)), "unless right next to it");
     }
 
     #[test]

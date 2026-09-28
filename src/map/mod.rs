@@ -247,9 +247,15 @@ pub struct GameMap {
     pub sectors: Vec<Sector>,
     /// Starting King position per faction, indexed by `Faction::index()`.
     pub spawns: [TilePos; 2],
-    /// Bumped whenever terrain changes during a match (e.g. a vehicle
-    /// parks), so cached line-of-sight gets recomputed.
+    /// Bumped whenever terrain or smoke changes during a match (a vehicle
+    /// parks, a wall is blown up, smoke is popped), so cached
+    /// line-of-sight gets recomputed.
     pub version: u32,
+    /// Smoke clouds: tile -> tick the smoke clears. Smoke blocks sight.
+    pub smoke: std::collections::HashMap<TilePos, u64>,
+    /// Every tile whose terrain changed during the match, in order (the
+    /// renderer repaints them).
+    pub terrain_log: Vec<TilePos>,
 }
 
 impl GameMap {
@@ -271,6 +277,10 @@ impl GameMap {
             Faction::Humans => pos.y < MAP_H / 2,
             Faction::Termbots => pos.y >= MAP_H / 2,
         }
+    }
+
+    pub fn smoky(&self, pos: TilePos) -> bool {
+        !self.smoke.is_empty() && self.smoke.contains_key(&pos)
     }
 
     pub fn spawn(&self, faction: Faction) -> TilePos {

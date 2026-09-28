@@ -144,6 +144,7 @@ pub fn update_vehicles(
             map.tile_mut(*pos).feature = Feature::Vehicle;
             if fully_connected(&map) {
                 map.version += 1;
+                map.terrain_log.push(*pos);
                 commands.spawn((
                     MatchEntity,
                     ParkedVehicle { wrecked: vehicle.destroyed },

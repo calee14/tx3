@@ -1,10 +1,14 @@
 //! The army panel (right side): build a platoon of 1-5 fighters, then
 //! click the map to place it (setup) or deploy it (battle).
 //!
-//! Setup: place platoons anywhere in your half, undo the last one, use the
+//! Setup: place platoons anywhere in your half, plant hidden gadgets
+//! (mines, bombs, turrets, artillery), undo the last placement, use the
 //! default army, and start the battle when ready.
 //! Battle: pick "On foot" (walk from base) or "Vehicle" (+150 Supply,
 //! rides to the spot and parks there as cover), then click an explored tile.
+//! Or call an air strike (250 Supply, 90 s cooldown): click an explored
+//! tile; the bombs fall in a line through it, along your line of sight
+//! from the King.
 
 use bevy::prelude::*;
 
@@ -16,8 +20,19 @@ use crate::sim::economy::{
 };
 use crate::sim::fighter::Fighter;
 use crate::sim::platoon::MAX_PLATOON_SIZE;
+use crate::sim::gadgets::{AIR_STRIKE_COST, AirSupport, GadgetKind};
 use crate::sim::vehicle::Vehicle;
-use crate::sim::{CommandQueue, SimCommand};
+use crate::sim::{CommandQueue, SIM_HZ, SimCommand, SimTick};
+
+/// One line on what a gadget does.
+pub fn gadget_blurb(kind: GadgetKind) -> &'static str {
+    match kind {
+        GadgetKind::Mine => "Explodes under the first enemy to step on it.",
+        GadgetKind::Bomb => "Big blast when enemies come within 2 tiles.",
+        GadgetKind::Turret => "Automatic gun (range 11). Tough and never scared.",
+        GadgetKind::Artillery => "Shells enemy groups your side can see (range 50).",
+    }
+}
 
 pub struct ArmyPanelPlugin;
 
@@ -37,11 +52,26 @@ impl Plugin for ArmyPanelPlugin {
 pub struct ArmyBuilder {
     pub classes: Vec<FighterClass>,
     pub vehicle: bool,
+    /// Setup: a gadget to place with the next click.
+    pub gadget: Option<GadgetKind>,
+    /// Battle: the next click calls an air strike.
+    pub air_strike: bool,
 }
 
 impl ArmyBuilder {
     pub fn is_empty(&self) -> bool {
         self.classes.is_empty()
+    }
+
+    /// Is the next map click placing something (platoon, gadget, strike)?
+    pub fn placing(&self) -> bool {
+        !self.classes.is_empty() || self.gadget.is_some() || self.air_strike
+    }
+
+    pub fn cancel(&mut self) {
+        self.classes.clear();
+        self.gadget = None;
+        self.air_strike = false;
     }
 }
 
@@ -51,6 +81,8 @@ pub enum PanelButton {
     RemoveLast,
     Clear,
     Transport,
+    Gadget(GadgetKind),
+    AirStrike,
     DefaultArmy,
     Undo,
     StartBattle,
@@ -58,10 +90,10 @@ pub enum PanelButton {
 
 impl PanelButton {
     fn setup_only(self) -> bool {
-        matches!(self, PanelButton::DefaultArmy | PanelButton::Undo | PanelButton::StartBattle)
+        matches!(self, PanelButton::DefaultArmy | PanelButton::Undo | PanelButton::StartBattle | PanelButton::Gadget(_))
     }
     fn battle_only(self) -> bool {
-        matches!(self, PanelButton::Transport)
+        matches!(self, PanelButton::Transport | PanelButton::AirStrike)
     }
 }
 
@@ -117,8 +149,19 @@ fn spawn_panel(mut commands: Commands) {
             (PanelHeader, Text::new("\n"), TextFont::from_font_size(14.0), TextColor(Color::WHITE)),
             (row(), children![button(PanelButton::Add(Assaulter)), button(PanelButton::Add(Sniper))]),
             (row(), children![button(PanelButton::Add(HeavyWeapons)), button(PanelButton::Add(Juggernaut))]),
+            (row(), children![button(PanelButton::Add(Engineer))]),
             (row(), children![button(PanelButton::RemoveLast), button(PanelButton::Clear)]),
             (row(), children![button(PanelButton::Transport)]),
+            (
+                row(),
+                children![
+                    button(PanelButton::Gadget(GadgetKind::Mine)),
+                    button(PanelButton::Gadget(GadgetKind::Bomb)),
+                    button(PanelButton::Gadget(GadgetKind::Turret)),
+                    button(PanelButton::Gadget(GadgetKind::Artillery)),
+                ]
+            ),
+            (row(), children![button(PanelButton::AirStrike)]),
             (row(), children![button(PanelButton::DefaultArmy), button(PanelButton::Undo)]),
             (row(), children![button(PanelButton::StartBattle)]),
             (
@@ -142,6 +185,8 @@ fn panel_buttons(
         }
         match *kind {
             PanelButton::Add(class) => {
+                builder.gadget = None;
+                builder.air_strike = false;
                 if builder.classes.len() < MAX_PLATOON_SIZE {
                     builder.classes.push(class);
                 }
@@ -149,7 +194,17 @@ fn panel_buttons(
             PanelButton::RemoveLast => {
                 builder.classes.pop();
             }
-            PanelButton::Clear => builder.classes.clear(),
+            PanelButton::Clear => builder.cancel(),
+            PanelButton::Gadget(kind) if !phase.battle => {
+                let again = builder.gadget == Some(kind);
+                builder.cancel();
+                builder.gadget = if again { None } else { Some(kind) };
+            }
+            PanelButton::AirStrike if phase.battle => {
+                let again = builder.air_strike;
+                builder.cancel();
+                builder.air_strike = !again;
+            }
             PanelButton::Transport => builder.vehicle = !builder.vehicle,
             PanelButton::DefaultArmy if !phase.battle => {
                 for c in default_army_commands(local.0) {
@@ -158,7 +213,7 @@ fn panel_buttons(
             }
             PanelButton::Undo if !phase.battle => queue.push(SimCommand::UndoPlacement { issuer: local.0 }),
             PanelButton::StartBattle if !phase.battle => {
-                builder.classes.clear();
+                builder.cancel();
                 queue.push(SimCommand::Ready { issuer: local.0 });
             }
             _ => {}
@@ -171,6 +226,8 @@ fn update_panel(
     local: Res<LocalPlayer>,
     phase: Res<MatchPhase>,
     supply: Res<Supply>,
+    tick: Res<SimTick>,
+    air: Res<AirSupport>,
     builder: Res<ArmyBuilder>,
     fighters: Query<(&Faction, &Fighter)>,
     vehicles: Query<(&Faction, &Vehicle)>,
@@ -194,7 +251,15 @@ fn update_panel(
     };
 
     let mut lines = Vec::new();
-    if builder.is_empty() {
+    if let Some(kind) = builder.gadget {
+        let s = kind.stats();
+        lines.push(format!("Placing: {} ({:.0})", s.name, s.cost));
+        lines.push(gadget_blurb(kind).to_string());
+        lines.push("Click inside your half. Hidden from the enemy until found.\nRight-click cancels.".into());
+    } else if builder.air_strike {
+        lines.push(format!("Air strike ({AIR_STRIKE_COST:.0}): click an explored tile.").to_string());
+        lines.push("5 bombs in a line through it, along the line from your\nKing. 4 s warning (the enemy may see it coming).".into());
+    } else if builder.is_empty() {
         lines.push(format!("New platoon: add 1-{MAX_PLATOON_SIZE} fighters"));
     } else {
         let names: Vec<&str> = builder.classes.iter().map(|c| c.stats().letter).collect();
@@ -230,7 +295,9 @@ fn update_panel(
     for (kind, interaction, mut bg, mut node, children) in &mut buttons {
         let hidden = (kind.setup_only() && phase.battle) || (kind.battle_only() && !phase.battle);
         node.display = if hidden { Display::None } else { Display::Flex };
-        let active = *kind == PanelButton::Transport && builder.vehicle;
+        let active = (*kind == PanelButton::Transport && builder.vehicle)
+            || matches!(*kind, PanelButton::Gadget(g) if builder.gadget == Some(g))
+            || (*kind == PanelButton::AirStrike && builder.air_strike);
         bg.0 = match (active, interaction) {
             (true, _) => ACTIVE,
             (false, Interaction::Hovered | Interaction::Pressed) => HOVER,
@@ -247,6 +314,17 @@ fn update_panel(
                     format!("Transport: Vehicle (+{VEHICLE_COST:.0})")
                 } else {
                     "Transport: On foot".into()
+                }
+            }
+            PanelButton::Gadget(g) => format!("{} {:.0}", g.stats().name, g.stats().cost),
+            PanelButton::AirStrike => {
+                let wait = air.ready_tick[me.index()].saturating_sub(tick.0).div_ceil(SIM_HZ as u64);
+                if wait > 0 {
+                    format!("Air strike {AIR_STRIKE_COST:.0}  (ready in {wait} s)")
+                } else if have < AIR_STRIKE_COST {
+                    format!("Air strike {AIR_STRIKE_COST:.0}  (not enough Supply)")
+                } else {
+                    format!("Air strike {AIR_STRIKE_COST:.0}")
                 }
             }
             PanelButton::DefaultArmy => "Place default army".into(),

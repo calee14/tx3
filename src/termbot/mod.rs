@@ -21,6 +21,10 @@
 //! 5. Moves its King away from danger.
 //! 6. Buys reinforcements that counter what it has seen, by vehicle when
 //!    far or urgent.
+//! 7. Uses gadgets: hides traps and a turret during setup (more for the
+//!    careful styles), calls air strikes on big, slow enemy groups away
+//!    from its own troops, and has engineers build turrets and bombs
+//!    now and then. It only knows about enemy gadgets its side has found.
 
 pub mod intel;
 pub mod planning;
@@ -38,12 +42,13 @@ use crate::sim::economy::{
     MatchPhase, Supply, Territory, base_entry, count_classes, in_battle, in_setup, platoon_cost, seconds_left,
 };
 use crate::sim::fighter::{Condition, Fighter};
+use crate::sim::gadgets::{AIR_STRIKE_COST, AirSupport, Concealed, GadgetKind, KnownTraps};
 use crate::sim::perception::Perception;
 use crate::sim::platoon::{Mission, Platoon, PlatoonId};
 use crate::sim::vehicle::Vehicle;
 use crate::sim::{CommandQueue, SIM_HZ, SimCommand, SimRng, SimSet, SimTick, Unit, UnitClass};
 use intel::{Behaviour, EnemyGroup, FIRING_MEMORY_TICKS, Sighting, class_weight, read_enemy};
-use planning::{KnownEnemy, Style, choose_style, depth, nearest_ok, plan_setup, reinforcement};
+use planning::{KnownEnemy, Style, choose_style, depth, nearest_ok, plan_gadgets, plan_setup, reinforcement};
 
 /// The commander re-reads the battlefield this often (2 s).
 const THINK_INTERVAL: u64 = 40;
@@ -129,6 +134,8 @@ pub struct Brain {
     king_moved_tick: u64,
     posture_since: u64,
     last_probe_tick: u64,
+    /// Earliest tick for the next engineer build order.
+    next_build: u64,
     /// Current push objective and when it was chosen (kept for a while so
     /// platoons aren't re-signalled every time the estimate wobbles).
     push_target: Option<(TilePos, u64)>,
@@ -158,6 +165,7 @@ impl Brain {
             king_moved_tick: 0,
             posture_since: 0,
             last_probe_tick: 0,
+            next_build: 60 * SIM_HZ as u64,
             push_target: None,
             own_units: HashMap::new(),
             our_losses: 0.0,
@@ -198,9 +206,20 @@ fn ai_setup(
             queue.push(SimCommand::PlacePlatoon { issuer: brain.faction, classes: classes.clone(), anchor: *anchor });
             brain.setup_homes.push_back(*anchor);
         }
+        let anchors: Vec<TilePos> = plan.iter().map(|(_, a)| *a).collect();
+        let gadgets = plan_gadgets(&map, brain.faction, brain.style, &anchors, &mut rng.0);
+        for &(kind, at) in &gadgets {
+            queue.push(SimCommand::PlaceGadget { issuer: brain.faction, kind, at });
+        }
         queue.push(SimCommand::Ready { issuer: brain.faction });
         brain.placed = true;
-        let text = format!("{} style, {} platoons placed", brain.style.name(), plan.len());
+        let names: Vec<&str> = gadgets.iter().map(|(k, _)| k.stats().name).collect();
+        let text = format!(
+            "{} style, {} platoons placed, hidden: {}",
+            brain.style.name(),
+            plan.len(),
+            names.join(", ")
+        );
         brain.note(0, text);
     }
 }
@@ -217,6 +236,7 @@ struct Ours {
     strength: f32,
     fighters: usize,
     engaged: bool,
+    has_engineer: bool,
 }
 
 impl Ours {
@@ -240,6 +260,7 @@ type UnitView<'a> = (
     &'a TilePos,
     Option<&'a Condition>,
     Option<&'a Perception>,
+    Option<&'a Concealed>,
 );
 
 #[allow(clippy::too_many_arguments)]
@@ -252,16 +273,25 @@ fn ai_battle(
     mut rng: ResMut<SimRng>,
     mut queue: ResMut<CommandQueue>,
     mut ais: ResMut<AiCommanders>,
+    air: Res<AirSupport>,
+    known_traps: Res<KnownTraps>,
     platoons: Query<(&Faction, &Platoon)>,
     units: Query<UnitView>,
     fighters: Query<(&Faction, &Fighter)>,
     vehicles: Query<(&Faction, &Vehicle)>,
 ) {
-    let world = World { tick: tick.0, map: &map, fog: &fog, territory: &territory };
     for brain in &mut ais.brains {
         if tick.0 < brain.next_think {
             continue;
         }
+        let world = World {
+            tick: tick.0,
+            map: &map,
+            fog: &fog,
+            territory: &territory,
+            air_ready: air.ready(brain.faction, tick.0),
+            known_traps: known_traps.of(brain.faction).len(),
+        };
         brain.next_think = tick.0 + THINK_INTERVAL;
         let counts = count_classes(brain.faction, fighters.iter(), vehicles.iter());
         think(brain, &world, supply.of(brain.faction), &counts, &mut rng.0, &mut queue, &platoons, &units);
@@ -273,6 +303,10 @@ struct World<'a> {
     map: &'a GameMap,
     fog: &'a FogOfWar,
     territory: &'a Territory,
+    /// Our air strike is off cooldown.
+    air_ready: bool,
+    /// Enemy traps our side has found.
+    known_traps: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -316,6 +350,7 @@ fn think(
                 strength: members.iter().map(|m| class_weight(m.1.class)).sum(),
                 fighters: members.len(),
                 engaged: members.iter().any(|m| m.5.is_some_and(|per| !per.seen_enemies.is_empty())),
+                has_engineer: members.iter().any(|m| m.1.class == UnitClass::Fighter(FighterClass::Engineer)),
             })
         })
         .collect();
@@ -340,9 +375,15 @@ fn think(
 
     // --- Look at the enemy (only what our side can see) ---
     let mut visible = HashSet::new();
-    for (e, unit, f, pos, cond, _) in units.iter() {
+    for (e, unit, f, pos, cond, _, concealed) in units.iter() {
         if *f != enemy || !w.fog.is_explored(me, *pos) {
             continue;
+        }
+        // Gadgets only once found; traps aren't something to fight.
+        match unit.class {
+            UnitClass::Gadget(k) if k.is_trap() => continue,
+            UnitClass::Gadget(_) if !concealed.is_some_and(|c| c.known_to(me)) => continue,
+            _ => {}
         }
         visible.insert(e);
         let firing = cond.and_then(|c| c.last_shot_tick).is_some_and(|t| tick.saturating_sub(t) <= FIRING_MEMORY_TICKS);
@@ -550,7 +591,77 @@ fn think(
     }
 
     // --- Reinforcements ---
-    buy(brain, w, supply, counts, queue, &groups, &ours, our_king, king_danger, push_target, edge);
+    let spent = buy(brain, w, supply, counts, queue, &groups, &ours, our_king, king_danger, push_target, edge);
+
+    // --- Gadgets ---
+    let own_structures = units
+        .iter()
+        .filter(|u| *u.2 == me && matches!(u.1.class, UnitClass::Gadget(GadgetKind::Turret | GadgetKind::Artillery)))
+        .count();
+    // Losing badly: every bit of Supply goes to rebuilding the army,
+    // unless the King itself is under threat.
+    if edge >= 0.6 || king_danger {
+        use_gadgets(brain, w, supply - spent, queue, &groups, &ours, our_king, own_structures);
+    }
+}
+
+/// Air strikes on big, slow enemy groups away from our own troops, and
+/// now and then an engineer build.
+#[allow(clippy::too_many_arguments)]
+fn use_gadgets(
+    brain: &mut Brain,
+    w: &World,
+    supply: f32,
+    queue: &mut CommandQueue,
+    groups: &[EnemyGroup],
+    ours: &[Ours],
+    our_king: TilePos,
+    own_structures: usize,
+) {
+    let tick = w.tick;
+    let me = brain.faction;
+    let mut supply = supply;
+    if w.air_ready && supply >= AIR_STRIKE_COST + 60.0 {
+        let target = groups
+            .iter()
+            .filter(|g| g.members.len() >= 3 && g.behaviour != Behaviour::Rushing)
+            .filter(|g| {
+                let safe = |c: Vec2| c.distance(g.center) > 8.0;
+                safe(to_vec(our_king)) && ours.iter().all(|p| safe(p.center))
+            })
+            .max_by(|a, b| a.strength.total_cmp(&b.strength));
+        if let Some(g) = target {
+            queue.push(SimCommand::AirStrike { issuer: me, target: g.center_tile() });
+            supply -= AIR_STRIKE_COST;
+            brain.note(tick, format!("air strike on {} enemies {}", g.members.len(), g.behaviour.name()));
+        }
+    }
+    if tick < brain.next_build {
+        return;
+    }
+    let kind = if own_structures < 2 { GadgetKind::Turret } else { GadgetKind::Bomb };
+    if supply < kind.stats().cost + 120.0 {
+        return;
+    }
+    let builder = ours.iter().find(|p| {
+        p.has_engineer
+            && p.mission == Mission::Overwatch
+            && !p.pending
+            && !p.engaged
+            && p.confusion < 20.0
+            && brain.orders.get(&p.id).is_none_or(|o| tick.saturating_sub(o.tick) >= MIN_SIGNAL_GAP)
+    });
+    let Some(p) = builder else { return };
+    let enemy_home = to_vec(w.map.spawn(me.opponent()));
+    let ahead = if kind == GadgetKind::Turret { 3.0 } else { 6.0 };
+    let spot = to_tile(p.center + (enemy_home - p.center).normalize_or_zero() * ahead);
+    let Some(site) = nearest_ok(w.map, spot, |t| w.fog.is_explored(me, t) && w.map.tile(t).passable()) else {
+        return;
+    };
+    queue.push(SimCommand::Build { issuer: me, platoon: p.id, kind, target: site });
+    brain.orders.insert(p.id, OrderMemo { mission: p.mission, tick });
+    brain.next_build = tick + 90 * SIM_HZ as u64;
+    brain.note(tick, format!("{}: engineer builds a {}", p.name, kind.stats().name));
 }
 
 /// The counter to what an enemy group seems to be doing.
@@ -691,9 +802,12 @@ fn pick_push_target(w: &World, me: Faction, groups: &[EnemyGroup], ours: &[Ours]
     best.or(enemy_king).or_else(|| search_target(w, me, our_center)).unwrap_or_else(|| w.map.spawn(me.opponent()))
 }
 
-/// The nearest unexplored ground in the enemy's half (where the enemy
-/// King might be hiding).
+/// Where to look for the enemy King: a sizeable unexplored area in the
+/// enemy's half, preferring ones near its starting corner (where Kings
+/// hide) and not too far from us. Small unexplored pockets (behind a
+/// ledge, say) are ignored, so the search doesn't dither between them.
 fn search_target(w: &World, me: Faction, from: Vec2) -> Option<TilePos> {
+    let enemy_spawn = to_vec(w.map.spawn(me.opponent()));
     let mut best: Option<(f32, TilePos)> = None;
     for y in (0..crate::map::MAP_H).step_by(4) {
         for x in (0..crate::map::MAP_W).step_by(4) {
@@ -701,9 +815,24 @@ fn search_target(w: &World, me: Faction, from: Vec2) -> Option<TilePos> {
             if w.map.in_home_half(me, p) || w.fog.is_explored(me, p) || !w.map.tile(p).passable() {
                 continue;
             }
-            let d = to_vec(p).distance(from);
-            if best.is_none_or(|(bd, _)| d < bd) {
-                best = Some((d, p));
+            let (mut unexplored, mut total) = (0, 0);
+            for dy in (-6..=6).step_by(2) {
+                for dx in (-6..=6).step_by(2) {
+                    let q = p.offset(dx, dy);
+                    if q.in_bounds() {
+                        total += 1;
+                        if !w.fog.is_explored(me, q) {
+                            unexplored += 1;
+                        }
+                    }
+                }
+            }
+            if unexplored * 2 < total {
+                continue;
+            }
+            let score = to_vec(p).distance(from) * 0.5 + to_vec(p).distance(enemy_spawn);
+            if best.is_none_or(|(b, _)| score < b) {
+                best = Some((score, p));
             }
         }
     }
@@ -760,11 +889,11 @@ fn buy(
     king_danger: bool,
     push_target: TilePos,
     edge: f32,
-) {
+) -> f32 {
     let tick = w.tick;
     let losing_badly = edge < 0.6 && !king_danger;
     if tick < brain.next_buy && !(king_danger && tick + 20 * SIM_HZ as u64 > brain.next_buy) {
-        return;
+        return 0.0;
     }
     let me = brain.faction;
 
@@ -775,9 +904,11 @@ fn buy(
             UnitClass::Fighter(FighterClass::Sniper) => known.snipers += 1,
             UnitClass::Fighter(FighterClass::HeavyWeapons) => known.heavies += 1,
             UnitClass::Fighter(FighterClass::Juggernaut) => known.juggernauts += 1,
+            UnitClass::Gadget(GadgetKind::Turret | GadgetKind::Artillery) => known.structures += 1,
             _ => {}
         }
     }
+    known.traps = w.known_traps as u32;
     let mut classes = reinforcement(brain.style, &known, supply);
 
     // Where they're needed most.
@@ -806,7 +937,7 @@ fn buy(
         (to_vec(weakest), "to hold the line")
     };
     let Some(dest) = nearest_ok(w.map, to_tile(spot), |t| w.fog.is_explored(me, t) && w.map.tile(t).passable()) else {
-        return;
+        return 0.0;
     };
     let vehicle = king_danger || (!losing_badly && base_entry(w.map, me).distance(dest) > 45.0);
     let reserve = if king_danger { 0.0 } else { 80.0 };
@@ -830,7 +961,7 @@ fn buy(
     let cost = platoon_cost(&classes, counts, vehicle);
     if cost + reserve > supply {
         brain.next_buy = tick + THINK_INTERVAL;
-        return;
+        return 0.0;
     }
     queue.push(SimCommand::Deploy { issuer: me, classes: classes.clone(), vehicle, target: dest });
     brain.next_buy = tick + 10 * SIM_HZ as u64;
@@ -838,4 +969,5 @@ fn buy(
     let how = if vehicle { "by vehicle" } else { "on foot" };
     let d = depth(me, dest);
     brain.note(tick, format!("buys {} {how} {why} (depth {d})", letters.join("")));
+    cost
 }

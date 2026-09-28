@@ -23,6 +23,7 @@ use super::classes::FighterClass;
 use super::combat::MatchOutcome;
 use super::fighter::Fighter;
 use super::platoon::{MAX_PLATOON_SIZE, Mission, NewPlatoon, Platoon, nearest_free_tile, roll_recruits, spawn_platoon};
+use super::gadgets::spawn_gadget;
 use super::vehicle::{Vehicle, spawn_vehicle};
 use super::{CommandQueue, DT, SIM_HZ, SimCommand, SimRng, SimTick, Unit, UnitIndex};
 use crate::faction::Faction;
@@ -49,6 +50,7 @@ pub fn base_cost(class: FighterClass) -> f32 {
         FighterClass::Sniper => 90.0,
         FighterClass::HeavyWeapons => 80.0,
         FighterClass::Juggernaut => 120.0,
+        FighterClass::Engineer => 70.0,
     }
 }
 
@@ -58,12 +60,13 @@ fn class_index(class: FighterClass) -> usize {
         FighterClass::Sniper => 1,
         FighterClass::HeavyWeapons => 2,
         FighterClass::Juggernaut => 3,
+        FighterClass::Engineer => 4,
     }
 }
 
 /// How many fighters of each class a side currently has.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ClassCounts([u32; 4]);
+pub struct ClassCounts([u32; 5]);
 
 impl ClassCounts {
     pub fn get(&self, class: FighterClass) -> u32 {
@@ -143,9 +146,18 @@ pub fn in_battle(phase: Option<Res<MatchPhase>>) -> bool {
     phase.is_some_and(|p| p.battle)
 }
 
-/// Platoons placed during setup, in order, so the last can be undone.
+/// Something placed during setup.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SetupEntry {
+    Platoon(Entity),
+    /// A gadget, with what it cost.
+    Gadget(Entity, f32),
+}
+
+/// Platoons and gadgets placed during setup, in order, so the last can be
+/// undone.
 #[derive(Resource, Debug, Default)]
-pub struct SetupLog(pub [Vec<Entity>; 2]);
+pub struct SetupLog(pub [Vec<SetupEntry>; 2]);
 
 /// Who controls each sector. A sector changes hands when one side has
 /// fighters in it and the other has none.
@@ -256,14 +268,45 @@ pub fn process_setup_commands(
                     },
                     |p| map.in_home_half(issuer, p),
                 );
-                log.0[i].push(platoon);
+                log.0[i].push(SetupEntry::Platoon(platoon));
+            }
+            SimCommand::PlaceGadget { issuer, kind, at } => {
+                let i = issuer.index();
+                let occupied = taken.contains(&at);
+                if phase.ready[i]
+                    || !at.in_bounds()
+                    || !map.in_home_half(issuer, at)
+                    || !map.tile(at).passable()
+                    || occupied
+                {
+                    continue;
+                }
+                let cost = kind.stats().cost;
+                if cost > supply.0[i] {
+                    continue;
+                }
+                supply.0[i] -= cost;
+                taken.insert(at);
+                let gadget = spawn_gadget(&mut commands, &mut index, issuer, kind, at);
+                log.0[i].push(SetupEntry::Gadget(gadget, cost));
             }
             SimCommand::UndoPlacement { issuer } => {
                 let i = issuer.index();
                 if phase.ready[i] {
                     continue;
                 }
-                let Some(entity) = log.0[i].pop() else { continue };
+                let entity = match log.0[i].pop() {
+                    Some(SetupEntry::Platoon(e)) => e,
+                    Some(SetupEntry::Gadget(e, paid)) => {
+                        supply.0[i] += paid;
+                        if let Ok(unit) = units.get(e) {
+                            index.entities.remove(&unit.id);
+                        }
+                        commands.entity(e).despawn();
+                        continue;
+                    }
+                    None => continue,
+                };
                 if let Ok(platoon) = platoons.get(entity) {
                     supply.0[i] += platoon.paid;
                     for &m in &platoon.members {

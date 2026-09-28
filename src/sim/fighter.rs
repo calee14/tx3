@@ -52,6 +52,12 @@ pub enum Decision {
     Retreating,
     /// Platoon too confused by signals to act on orders.
     Frozen,
+    /// Getting out from under an incoming strike.
+    Dodging,
+    /// Engineer building a gadget.
+    Building,
+    /// Engineer defusing an enemy trap.
+    Defusing,
 }
 
 impl Decision {
@@ -63,6 +69,9 @@ impl Decision {
             Decision::TakingCover => "Taking cover",
             Decision::Retreating => "Retreating",
             Decision::Frozen => "Frozen (orders unclear)",
+            Decision::Dodging => "Dodging an incoming strike",
+            Decision::Building => "Building",
+            Decision::Defusing => "Defusing a trap",
         }
     }
 }
@@ -90,6 +99,28 @@ pub struct Condition {
     /// Tick it last fired. Firing is visible to anyone watching (tracers),
     /// so the enemy commander may use it.
     pub last_shot_tick: Option<u64>,
+    /// An engineer's current job (building or defusing), if any.
+    pub work: Option<Work>,
+}
+
+/// An engineer job.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Work {
+    pub kind: WorkKind,
+    /// Where the work happens (build site, or the trap being defused).
+    pub tile: TilePos,
+    /// 0 to 1.
+    pub progress: f32,
+    /// Supply paid for a build (refunded if the build is abandoned).
+    pub paid: f32,
+    /// Seconds spent unable to reach the work site (gives up after a few).
+    pub idle: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WorkKind {
+    Build(super::gadgets::GadgetKind),
+    Defuse(Entity),
 }
 
 impl Condition {
@@ -104,6 +135,61 @@ impl Condition {
             next_think: 0,
             cover: CoverLevel::None,
             last_shot_tick: None,
+            work: None,
+        }
+    }
+}
+
+/// Experience from fighting. Enough of it earns a rank, which raises every
+/// trait by 5 (up to 100).
+#[derive(Component, Debug, Default, Clone, Copy)]
+pub struct Veterancy {
+    pub xp: f32,
+    pub rank: u8,
+}
+
+/// XP needed for each rank above Recruit.
+pub const RANK_XP: [f32; 2] = [8.0, 20.0];
+pub const RANK_TRAIT_BONUS: u8 = 5;
+
+impl Veterancy {
+    pub fn rank_name(&self) -> &'static str {
+        match self.rank {
+            0 => "Recruit",
+            1 => "Veteran",
+            _ => "Elite",
+        }
+    }
+
+    /// Add XP; returns true if the fighter ranked up (traits improved).
+    pub fn gain(&mut self, xp: f32, traits: &mut Traits) -> bool {
+        self.xp += xp;
+        let mut ranked = false;
+        while (self.rank as usize) < RANK_XP.len() && self.xp >= RANK_XP[self.rank as usize] {
+            self.rank += 1;
+            ranked = true;
+            for t in [
+                &mut traits.accuracy,
+                &mut traits.iq,
+                &mut traits.tactics,
+                &mut traits.bravery,
+                &mut traits.leadership,
+            ] {
+                *t = t.saturating_add(RANK_TRAIT_BONUS).min(100);
+            }
+        }
+        ranked
+    }
+}
+
+/// XP earned this tick, applied by `apply_experience`.
+#[derive(Resource, Default, Debug)]
+pub struct XpLog(pub Vec<(Entity, f32)>);
+
+pub fn apply_experience(mut log: ResMut<XpLog>, mut fighters: Query<(&mut Veterancy, &mut Traits)>) {
+    for (entity, xp) in log.0.drain(..) {
+        if let Ok((mut vet, mut traits)) = fighters.get_mut(entity) {
+            vet.gain(xp, &mut traits);
         }
     }
 }
@@ -128,6 +214,8 @@ pub enum Status {
     Brave,
     Moving,
     InCover(CoverLevel),
+    Veteran,
+    Elite,
 }
 
 impl Status {
@@ -145,6 +233,8 @@ impl Status {
             Status::Moving => "Moving (less accurate)",
             Status::InCover(CoverLevel::Heavy) => "In heavy cover",
             Status::InCover(_) => "In light cover",
+            Status::Veteran => "Veteran",
+            Status::Elite => "Elite",
         }
     }
 
@@ -160,6 +250,8 @@ impl Status {
             Status::Injured => Some(("+", Color::srgb(1.0, 0.4, 0.4))),
             Status::Shaken => Some(("~", Color::srgb(0.7, 0.7, 1.0))),
             Status::Brave => Some(("^", Color::srgb(0.5, 0.9, 1.0))),
+            Status::Elite => Some(("**", Color::srgb(1.0, 0.85, 0.2))),
+            Status::Veteran => Some(("*", Color::srgb(1.0, 0.85, 0.2))),
             _ => None,
         }
     }
@@ -168,7 +260,14 @@ impl Status {
     pub fn visible_to_enemy(self) -> bool {
         matches!(
             self,
-            Status::Broken | Status::Pinned | Status::Injured | Status::BadlyInjured | Status::Moving | Status::InCover(_)
+            Status::Broken
+                | Status::Pinned
+                | Status::Injured
+                | Status::BadlyInjured
+                | Status::Moving
+                | Status::InCover(_)
+                | Status::Veteran
+                | Status::Elite
         )
     }
 }
@@ -179,6 +278,7 @@ pub fn statuses(
     platoon_confusion: f32,
     moving: bool,
     cover: CoverLevel,
+    rank: u8,
 ) -> Vec<Status> {
     let mut out = Vec::new();
     if condition.morale < BROKEN {
@@ -213,5 +313,29 @@ pub fn statuses(
     if cover != CoverLevel::None {
         out.push(Status::InCover(cover));
     }
+    match rank {
+        0 => {}
+        1 => out.push(Status::Veteran),
+        _ => out.push(Status::Elite),
+    }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ranks_raise_traits() {
+        let mut traits = Traits { accuracy: 50, iq: 98, tactics: 40, bravery: 60, leadership: 30 };
+        let mut vet = Veterancy::default();
+        assert!(!vet.gain(5.0, &mut traits));
+        assert!(vet.gain(4.0, &mut traits), "8 XP makes a Veteran");
+        assert_eq!(vet.rank_name(), "Veteran");
+        assert_eq!(traits.accuracy, 55);
+        assert_eq!(traits.iq, 100, "capped at 100");
+        assert!(vet.gain(20.0, &mut traits));
+        assert_eq!(vet.rank_name(), "Elite");
+        assert_eq!(traits.tactics, 50);
+    }
 }

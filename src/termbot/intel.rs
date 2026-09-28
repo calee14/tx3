@@ -12,6 +12,7 @@ use bevy::prelude::*;
 use crate::map::TilePos;
 use crate::sim::UnitClass;
 use crate::sim::classes::FighterClass;
+use crate::sim::gadgets::GadgetKind;
 
 /// How long a shot keeps a unit marked as "firing" (3 s).
 pub const FIRING_MEMORY_TICKS: u64 = 60;
@@ -98,6 +99,10 @@ pub fn class_weight(class: UnitClass) -> f32 {
         UnitClass::Fighter(FighterClass::Sniper) => 1.3,
         UnitClass::Fighter(FighterClass::HeavyWeapons) => 1.3,
         UnitClass::Fighter(FighterClass::Juggernaut) => 1.8,
+        UnitClass::Fighter(FighterClass::Engineer) => 0.9,
+        UnitClass::Gadget(GadgetKind::Turret) => 1.5,
+        UnitClass::Gadget(GadgetKind::Artillery) => 1.0,
+        UnitClass::Gadget(_) => 0.0,
     }
 }
 

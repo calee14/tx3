@@ -6,6 +6,10 @@
 //!   ? confused, ! suppressed, ++/+ injured, ~ shaken, ^ brave.
 //! - Health bar, and a gold marker over platoon leaders.
 //! - Shot tracers.
+//! - Gadgets: small dark squares (mines m, bombs b), turrets (T) and
+//!   artillery (Q). Enemy gadgets only appear once your side has found them.
+//! - Strike warnings (red rings that close in as the impact nears),
+//!   explosions, and smoke.
 
 use bevy::prelude::*;
 
@@ -14,7 +18,10 @@ use crate::fog::{FogDebug, FogOfWar};
 use crate::map::TilePos;
 use crate::sim::classes::FighterClass;
 use crate::sim::combat::ShotLog;
-use crate::sim::fighter::{Condition, Fighter, Health, statuses};
+use crate::sim::fighter::{Condition, Fighter, Health, Veterancy, statuses};
+use crate::sim::gadgets::{BlastLog, Concealed, GadgetKind, Strike, StrikeKind};
+use crate::sim::SimTick;
+use crate::map::{GameMap, TILE_SIZE};
 use crate::sim::platoon::Platoon;
 use crate::sim::vehicle::ParkedVehicle;
 use crate::sim::{Mover, Unit, UnitClass};
@@ -27,13 +34,15 @@ pub struct UnitVisualsPlugin;
 
 impl Plugin for UnitVisualsPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Tracers>().add_systems(
+        app.init_resource::<Tracers>().init_resource::<Blasts>().add_systems(
             Update,
             (
                 attach_unit_visuals,
                 attach_parked_vehicle_visuals,
                 update_status_icons,
-                (draw_unit_overlays, collect_and_draw_tracers).run_if(resource_exists::<FogOfWar>),
+                (draw_unit_overlays, collect_and_draw_tracers, draw_strikes, draw_blasts, draw_smoke)
+                    .run_if(resource_exists::<FogOfWar>)
+                    .run_if(resource_exists::<crate::map::GameMap>),
             ),
         );
     }
@@ -73,13 +82,24 @@ fn attach_unit_visuals(mut commands: Commands, units: Query<(Entity, &Unit, &Fac
             UnitClass::King => (Vec2::splat(UNIT_SPRITE_SIZE + 3.0), faction.color()),
             UnitClass::Vehicle => (Vec2::new(18.0, 11.0), faction.color().darker(0.2)),
             UnitClass::Fighter(_) => (Vec2::splat(UNIT_SPRITE_SIZE), faction.color()),
+            UnitClass::Gadget(kind) => match kind {
+                GadgetKind::Mine => (Vec2::splat(7.0), faction.color().darker(0.35)),
+                GadgetKind::Bomb => (Vec2::splat(9.0), faction.color().darker(0.3)),
+                GadgetKind::Turret => (Vec2::splat(14.0), faction.color().darker(0.1)),
+                GadgetKind::Artillery => (Vec2::new(17.0, 12.0), faction.color().darker(0.1)),
+            },
         };
         commands.entity(entity).insert((Sprite::from_color(color, size), Visibility::default()));
+        // Dark trap sprites get a light letter.
+        let letter_color = match unit.class {
+            UnitClass::Gadget(k) if k.is_trap() => Color::srgb(0.9, 0.9, 0.9),
+            _ => Color::BLACK,
+        };
         commands.entity(entity).with_children(|parent| {
             parent.spawn((
                 Text2d::new(unit.class.letter()),
                 TextFont::from_font_size(10.0),
-                TextColor(Color::BLACK),
+                TextColor(letter_color),
                 Transform::from_xyz(0.0, 0.0, 1.0),
             ));
             parent.spawn((
@@ -95,20 +115,30 @@ fn attach_unit_visuals(mut commands: Commands, units: Query<(Entity, &Unit, &Fac
     }
 }
 
-/// Is this position visible to the local commander?
-fn shown(fog: &FogOfWar, debug: &FogDebug, local: LocalPlayer, faction: Faction, pos: TilePos) -> bool {
-    faction == local.0 || debug.show_all || fog.is_explored(local.0, pos)
+/// Is this unit visible to the local commander? Enemy units show on
+/// explored ground; enemy gadgets only once found.
+pub fn shown(
+    fog: &FogOfWar,
+    debug: &FogDebug,
+    local: LocalPlayer,
+    faction: Faction,
+    pos: TilePos,
+    concealed: Option<&Concealed>,
+) -> bool {
+    faction == local.0
+        || debug.show_all
+        || (fog.is_explored(local.0, pos) && concealed.is_none_or(|c| c.known_to(local.0)))
 }
 
 fn update_status_icons(
     local: Res<LocalPlayer>,
     platoons: Query<&Platoon>,
-    fighters: Query<(&Faction, &Fighter, &Condition, &Health, &Mover, &Children)>,
+    fighters: Query<(&Faction, &Fighter, &Condition, &Health, &Mover, &Veterancy, &Children)>,
     mut icons: Query<(&mut Text2d, &mut TextColor), With<StatusIcons>>,
 ) {
-    for (faction, fighter, cond, health, mover, children) in &fighters {
+    for (faction, fighter, cond, health, mover, vet, children) in &fighters {
         let confusion = platoons.get(fighter.platoon).map_or(0.0, |p| p.confusion);
-        let all = statuses(cond, health, confusion, !mover.path.is_empty(), cond.cover);
+        let all = statuses(cond, health, confusion, !mover.path.is_empty(), cond.cover, vet.rank);
         // Enemies only show what can be seen from outside.
         let visible: Vec<_> =
             all.into_iter().filter(|s| *faction == local.0 || s.visible_to_enemy()).filter_map(|s| s.icon()).collect();
@@ -130,11 +160,11 @@ fn draw_unit_overlays(
     debug: Res<FogDebug>,
     local: Res<LocalPlayer>,
     platoons: Query<&Platoon>,
-    units: Query<(Entity, &Faction, &TilePos, &Transform, &Health, Option<&Fighter>)>,
+    units: Query<(Entity, &Faction, &TilePos, &Transform, &Health, Option<&Fighter>, Option<&Concealed>)>,
     mut gizmos: Gizmos,
 ) {
-    for (entity, faction, pos, transform, health, fighter) in &units {
-        if !shown(&fog, &debug, *local, *faction, *pos) {
+    for (entity, faction, pos, transform, health, fighter, concealed) in &units {
+        if !shown(&fog, &debug, *local, *faction, *pos, concealed) {
             continue;
         }
         let p = transform.translation.truncate();
@@ -189,7 +219,7 @@ fn collect_and_draw_tracers(
             let off = ((shot.from.x * 31 + shot.to.y * 17) % 7 - 3) as f32 * 3.0;
             to += Vec2::new(off, -off * 0.7);
         }
-        let heavy = shot.shooter_class == FighterClass::Sniper;
+        let heavy = matches!(shot.shooter, UnitClass::Fighter(FighterClass::Sniper) | UnitClass::Gadget(_));
         tracers.0.push((from, to, shot.hit, heavy, if heavy { TRACER_SECONDS * 3.0 } else { TRACER_SECONDS }));
     }
     if !virt.is_paused() {
@@ -208,5 +238,101 @@ fn collect_and_draw_tracers(
             (false, false) => Color::srgba(1.0, 1.0, 1.0, a * 0.5),
         };
         gizmos.line_2d(from, to, color);
+    }
+}
+
+/// Incoming strikes: a red ring at each impact point, with an inner ring
+/// that closes in as the impact nears. Shown for your own strikes, and for
+/// enemy strikes landing on ground you've explored.
+fn draw_strikes(
+    tick: Res<SimTick>,
+    fixed: Res<Time<Fixed>>,
+    fog: Res<FogOfWar>,
+    debug: Res<FogDebug>,
+    local: Res<LocalPlayer>,
+    strikes: Query<&Strike>,
+    mut gizmos: Gizmos,
+) {
+    let now = tick.0 as f32 + fixed.overstep_fraction();
+    for strike in &strikes {
+        let color = match strike.kind {
+            StrikeKind::Air => Color::srgb(1.0, 0.3, 0.2),
+            StrikeKind::Artillery => Color::srgb(1.0, 0.45, 0.15),
+            _ => Color::srgb(1.0, 0.75, 0.2),
+        };
+        let mut points = Vec::new();
+        for &(at, due) in &strike.impacts {
+            let visible = strike.faction == local.0 || debug.show_all || fog.is_explored(local.0, at);
+            if !visible {
+                continue;
+            }
+            let p = at.to_world();
+            points.push(p);
+            let r = strike.radius * TILE_SIZE;
+            let total = (due.saturating_sub(strike.launched_tick)).max(1) as f32;
+            let left = ((due as f32 - now) / total).clamp(0.0, 1.0);
+            gizmos.circle_2d(Isometry2d::from_translation(p), r, color);
+            gizmos.circle_2d(Isometry2d::from_translation(p), r * left, color.with_alpha(0.6));
+            gizmos.line_2d(p - Vec2::new(4.0, 4.0), p + Vec2::new(4.0, 4.0), color);
+            gizmos.line_2d(p - Vec2::new(4.0, -4.0), p + Vec2::new(4.0, -4.0), color);
+        }
+        if strike.kind == StrikeKind::Air && points.len() > 1 {
+            gizmos.linestrip_2d(points, color.with_alpha(0.35));
+        }
+    }
+}
+
+/// Explosions, as expanding orange rings (purely visual).
+#[derive(Resource, Default)]
+struct Blasts(Vec<(Vec2, f32, f32)>);
+
+const BLAST_SECONDS: f32 = 0.5;
+
+fn draw_blasts(
+    time: Res<Time<Real>>,
+    virt: Res<Time<Virtual>>,
+    fog: Res<FogOfWar>,
+    debug: Res<FogDebug>,
+    local: Res<LocalPlayer>,
+    mut log: ResMut<BlastLog>,
+    mut blasts: ResMut<Blasts>,
+    mut gizmos: Gizmos,
+) {
+    for (at, radius) in log.0.drain(..) {
+        if debug.show_all || fog.is_explored(local.0, at) {
+            blasts.0.push((at.to_world(), radius * TILE_SIZE, BLAST_SECONDS));
+        }
+    }
+    if !virt.is_paused() {
+        let dt = time.delta_secs();
+        for b in &mut blasts.0 {
+            b.2 -= dt;
+        }
+        blasts.0.retain(|b| b.2 > 0.0);
+    }
+    for &(p, r, life) in &blasts.0 {
+        let t = 1.0 - life / BLAST_SECONDS;
+        let a = 1.0 - t;
+        gizmos.circle_2d(Isometry2d::from_translation(p), r * (0.3 + 0.7 * t), Color::srgba(1.0, 0.6, 0.15, a));
+        gizmos.circle_2d(Isometry2d::from_translation(p), r * 0.5 * (0.3 + 0.7 * t), Color::srgba(1.0, 0.9, 0.4, a));
+    }
+}
+
+/// Smoke clouds, as grey puffs on each smoky tile.
+fn draw_smoke(
+    map: Res<GameMap>,
+    fog: Res<FogOfWar>,
+    debug: Res<FogDebug>,
+    local: Res<LocalPlayer>,
+    mut gizmos: Gizmos,
+) {
+    for tile in map.smoke.keys() {
+        if !(debug.show_all || fog.is_explored(local.0, *tile)) {
+            continue;
+        }
+        let p = tile.to_world();
+        for r in [7.0, 5.0, 3.0] {
+            gizmos.circle_2d(Isometry2d::from_translation(p), r, Color::srgba(0.75, 0.75, 0.78, 0.55));
+        }
     }
 }

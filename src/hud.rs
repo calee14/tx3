@@ -12,11 +12,12 @@ use crate::faction::{Faction, LocalPlayer};
 use crate::fog::{FogDebug, FogOfWar};
 use crate::input::CursorWorld;
 use crate::map::{self, GameMap, TilePos};
-use crate::sim::classes::Traits;
+use crate::sim::classes::{Equipment, Traits, weapon_damage_type};
+use crate::sim::gadgets::{Concealed, Gadget, GadgetKind};
 use crate::sim::combat::MatchOutcome;
 use crate::sim::economy::{MatchPhase, Territory, seconds_left};
 use crate::sim::vehicle::Vehicle;
-use crate::sim::fighter::{Condition, Fighter, Health, statuses};
+use crate::sim::fighter::{Condition, Fighter, Health, Veterancy, statuses};
 use crate::sim::platoon::Platoon;
 use crate::sim::{Mover, SimTick, Unit, UnitClass};
 
@@ -147,9 +148,9 @@ fn update_hud(
     }
 
     lines.push(String::new());
-    lines.push("Army panel (right): build a platoon, then click the map".into());
-    lines.push("Left-click a fighter: select its platoon".into());
-    lines.push("1/2/3 or buttons: mission   Right-click: target".into());
+    lines.push("Army panel (right): build a platoon or pick a gadget / air strike, then click the map".into());
+    lines.push("Left-click a fighter: select its platoon   (or your artillery, to aim it)".into());
+    lines.push("1/2/3 or buttons: mission   4-7: engineer builds   Right-click: target".into());
     lines.push("Hover a fighter for details".into());
     lines.push("WASD/arrows/middle-drag: pan   Wheel: zoom".into());
     lines.push("Space: pause   F: debug view (no fog + AI thoughts)   N: new map".into());
@@ -188,6 +189,7 @@ type HoverQuery<'a> = (
     Option<&'a Traits>,
     Option<&'a Condition>,
     Option<&'a Vehicle>,
+    (Option<&'a Veterancy>, Option<&'a Equipment>, Option<&'a Gadget>, Option<&'a Concealed>),
 );
 
 #[allow(clippy::too_many_arguments)]
@@ -205,14 +207,16 @@ fn update_tooltip(
     let hovered = cursor.world.filter(|_| !cursor.over_ui).and_then(|w| {
         units
             .iter()
-            .filter(|u| *u.2 == local.0 || debug.show_all || fog.is_explored(local.0, *u.3))
+            .filter(|u| crate::units::shown(&fog, &debug, *local, *u.2, *u.3, u.11.3))
             .map(|u| (u.4.translation.truncate().distance(w), u))
             .filter(|(d, _)| *d <= 10.0)
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, u)| u)
     });
     let (node, visibility) = &mut *tooltip;
-    let Some((entity, unit, faction, _, _, health, mover, fighter, traits, cond, vehicle)) = hovered else {
+    let Some((entity, unit, faction, _, _, health, mover, fighter, traits, cond, vehicle, (vet, equipment, gadget, _))) =
+        hovered
+    else {
         **visibility = Visibility::Hidden;
         return;
     };
@@ -223,6 +227,21 @@ fn update_tooltip(
 
     if unit.class == UnitClass::King {
         lines.push(format!("Health {:.0}/{:.0}", health.current.max(0.0), health.max));
+    } else if let Some(g) = gadget {
+        let stats = g.kind.stats();
+        lines.push(format!("Health {:.0}/{:.0}   Armor: {}", health.current.max(0.0), health.max, stats.armor_class.name()));
+        lines.push(
+            match g.kind {
+                GadgetKind::Mine => "Explodes under the first enemy to step on it",
+                GadgetKind::Bomb => "Goes off when enemies come within 2 tiles",
+                GadgetKind::Turret => "Automatic gun, range 11",
+                GadgetKind::Artillery => "Shells enemy groups (3 s warning). Select it to aim.",
+            }
+            .to_string(),
+        );
+        if own && !g.kind.is_trap() && g.cooldown > 0.0 {
+            lines.push(format!("Reloading: {:.0} s", g.cooldown));
+        }
     } else if let Some(v) = vehicle {
         lines.push(format!("Health {:.0}/{:.0}  (armored)", health.current.max(0.0), health.max));
         if own {
@@ -248,6 +267,15 @@ fn update_tooltip(
                 t.accuracy, t.iq, t.tactics, t.bravery, t.leadership
             ));
         }
+        if let (Some(f), Some(eq)) = (fighter, equipment) {
+            let dmg = weapon_damage_type(f.class, eq.loadout);
+            let secret = if eq.known_to[local.0.opponent().index()] { "  (enemy knows)" } else { "  (secret)" };
+            lines.push(format!("Loadout: {}{}", eq.loadout.name(), secret));
+            lines.push(format!("Weapon: {}   Armor: {}", dmg.name(), f.class.stats().armor_class.name()));
+        }
+        if let Some(v) = vet {
+            lines.push(format!("Rank: {}  (XP {:.0})", v.rank_name(), v.xp));
+        }
     } else {
         let condition = match health.frac() {
             f if f > 0.6 => "healthy",
@@ -255,11 +283,18 @@ fn update_tooltip(
             _ => "badly wounded",
         };
         lines.push(format!("Looks {condition}. Traits unknown."));
+        if let (Some(f), Some(eq)) = (fighter, equipment) {
+            // Seen from outside: armor is obvious; the loadout only once used.
+            let loadout =
+                if eq.known_to[local.0.index()] { eq.loadout.name().to_string() } else { "unknown".to_string() };
+            lines.push(format!("Loadout: {loadout}   Armor: {}", f.class.stats().armor_class.name()));
+        }
     }
 
     if let Some(c) = cond {
         let confusion = platoon.map_or(0.0, |p| p.confusion);
-        let list: Vec<&str> = statuses(c, health, confusion, !mover.path.is_empty(), c.cover)
+        let rank = vet.map_or(0, |v| v.rank);
+        let list: Vec<&str> = statuses(c, health, confusion, !mover.path.is_empty(), c.cover, rank)
             .into_iter()
             .filter(|s| own || s.visible_to_enemy())
             .map(|s| s.name())

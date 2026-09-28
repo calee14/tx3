@@ -65,6 +65,8 @@ pub fn try_generate(seed: u64) -> Result<GameMap, GenError> {
         sectors: build_sectors(),
         spawns,
         version: 0,
+        smoke: Default::default(),
+        terrain_log: Vec::new(),
     };
 
     generate_elevation(&mut map, &mut rng);

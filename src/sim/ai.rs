@@ -25,6 +25,13 @@
 //! threat, with a penalty for any threat it would be fully exposed to, so a
 //! surrounded fighter settles for the spot that protects best overall.
 //!
+//! ## Strikes, traps and jobs
+//!
+//! Fighters that see an incoming strike's warning marker (or know about
+//! their own side's) may notice it and run clear: smarter, more tactical
+//! fighters notice sooner. Known enemy traps are walked around. Engineers
+//! with a job (building, defusing) go and do it unless pinned or broken.
+//!
 //! Two ways of taking cover:
 //! - Engage: covered, but still able to shoot back. Used when advancing,
 //!   fighting, and moving cover to cover.
@@ -37,10 +44,11 @@ use bevy::prelude::*;
 use rand::Rng;
 
 use super::classes::Traits;
-use super::fighter::{BROKEN, Condition, Decision, Fighter, Health, PINNED, SHAKEN, SUPPRESSED};
+use super::fighter::{BROKEN, Condition, Decision, Fighter, Health, PINNED, SHAKEN, SUPPRESSED, WorkKind};
+use super::gadgets::{Gadget, KnownTraps, Strike, danger_zones, escape_tile, work_spot};
 use super::perception::{Perception, line_of_sight};
 use super::platoon::{Mission, Platoon, slot_tile};
-use super::{Mover, SimRng, SimTick, Unit, set_destination};
+use super::{Mover, SimRng, SimTick, Unit, set_destination_avoiding};
 use crate::faction::Faction;
 use crate::map::{CoverLevel, GameMap, TilePos};
 
@@ -147,6 +155,7 @@ fn best_spot(
     radius: i32,
     from: TilePos,
     taken: &HashSet<TilePos>,
+    avoid: &HashSet<TilePos>,
     threats: &[Threat],
     mode: CoverMode,
     w: &SpotWeights,
@@ -155,7 +164,7 @@ fn best_spot(
     for dy in -radius..=radius {
         for dx in -radius..=radius {
             let t = center.offset(dx, dy);
-            if !t.in_bounds() || !map.tile(t).passable() || (taken.contains(&t) && t != from) {
+            if !t.in_bounds() || !map.tile(t).passable() || (taken.contains(&t) && t != from) || avoid.contains(&t) {
                 continue;
             }
             let d = center.distance(t);
@@ -212,7 +221,10 @@ pub fn decide(
     tick: Res<SimTick>,
     map: Res<GameMap>,
     mut rng: ResMut<SimRng>,
+    known: Res<KnownTraps>,
     platoons: Query<&Platoon>,
+    strikes: Query<&Strike>,
+    gadgets: Query<&TilePos, With<Gadget>>,
     kings: Query<(&Unit, &Faction, &TilePos), Without<Fighter>>,
     positions: Query<&TilePos, With<Unit>>,
     mut fighters: Query<(
@@ -229,7 +241,8 @@ pub fn decide(
     )>,
 ) {
     // Tiles already occupied or claimed by fighters, so they spread out.
-    let mut taken: HashSet<TilePos> = HashSet::new();
+    let mut taken: HashSet<TilePos> = gadgets.iter().copied().collect();
+    let zones = danger_zones(&strikes);
     // Enemies each platoon knows about (anyone in it can see them).
     let mut platoon_sightings: HashMap<Entity, Vec<Entity>> = HashMap::new();
     for (_, _, _, pos, fighter, _, _, perception, cond, _) in &fighters {
@@ -300,6 +313,16 @@ pub fn decide(
         let cover_mode = if defensive { CoverMode::Hide } else { engage };
         let prot_weight = 0.6 + 1.4 * tac;
 
+        // Incoming strikes this fighter knows about and is standing under.
+        let under: Vec<(TilePos, f32)> = zones
+            .iter()
+            .filter(|(t, r, f)| pos.distance(*t) <= r + 0.8 && (*f == *faction || perception.sees(*t)))
+            .map(|(t, r, _)| (*t, *r))
+            .collect();
+        let notices = !under.is_empty()
+            && (cond.decision == Decision::Dodging
+                || rng.0.random::<f32>() < 0.2 + 0.25 * (traits.iq() + traits.tac()));
+
         // Lower IQ = noisier, less consistent choices.
         let mut noise = || rng.0.random_range(0.0..0.2) * (1.0 - 0.7 * traits.iq());
 
@@ -308,8 +331,9 @@ pub fn decide(
         if let Some(g) = old_goal {
             taken.remove(&g);
         }
+        let avoid = known.of(*faction);
         let spot = |center: TilePos, radius: i32, mode: CoverMode, w: SpotWeights| {
-            best_spot(&map, center, radius, *pos, &taken, &threats, mode, &w).map(|(t, _)| t)
+            best_spot(&map, center, radius, *pos, &taken, avoid, &threats, mode, &w).map(|(t, _)| t)
         };
 
         let (decision, goal) = if cond.morale < BROKEN {
@@ -323,6 +347,10 @@ pub fn decide(
             let fallback = pos.offset(dir.x.round() as i32, dir.y.round() as i32);
             let w = SpotWeights { protection: 1.0, height: 0.0, near_center: 0.35, near_self: 0.0 };
             (Decision::Retreating, spot(fallback, 3, CoverMode::Hide, w))
+        } else if notices {
+            // Get out from under it, whatever else is going on.
+            let all: Vec<(TilePos, f32)> = zones.iter().map(|(t, r, _)| (*t, *r)).collect();
+            (Decision::Dodging, escape_tile(&map, *pos, &all, &taken))
         } else if platoon.frozen() {
             (Decision::Frozen, None)
         } else if cond.suppression >= PINNED {
@@ -332,6 +360,12 @@ pub fn decide(
                 // Crawl to the nearest spot that shields from the fire.
                 let w = SpotWeights { protection: 3.0, height: 0.0, near_center: 0.35, near_self: 0.8 };
                 (Decision::TakingCover, spot(*pos, 3, CoverMode::Hide, w))
+            }
+        } else if let Some(work) = cond.work {
+            match work.kind {
+                WorkKind::Build(_) => (Decision::Building, Some(work.tile)),
+                WorkKind::Defuse(_) if pos.distance(work.tile) <= 1.5 => (Decision::Defusing, None),
+                WorkKind::Defuse(_) => (Decision::Defusing, work_spot(&map, work.tile, *pos, &taken)),
             }
         } else {
             let at_slot = pos.distance(slot) <= 1.5;
@@ -394,7 +428,7 @@ pub fn decide(
                 // is a step or two away.
                 let w = SpotWeights { protection: prot_weight, height: 0.3 * tac, near_center: 0.0, near_self: 0.5 };
                 let here = spot_score(&map, *pos, *pos, *pos, &threats, engage, &w);
-                let better = best_spot(&map, *pos, 2, *pos, &taken, &threats, engage, &w)
+                let better = best_spot(&map, *pos, 2, *pos, &taken, avoid, &threats, engage, &w)
                     .filter(|&(t, s)| t != *pos && s > here + 0.5)
                     .map(|(t, _)| t);
                 (Decision::Fighting, better)
@@ -413,6 +447,9 @@ pub fn decide(
         if decision == Decision::Retreating {
             speed *= 1.15;
         }
+        if decision == Decision::Dodging {
+            speed *= 1.3;
+        }
         if cond.suppression >= 50.0 {
             speed *= 0.6;
         }
@@ -424,7 +461,7 @@ pub fn decide(
         match goal {
             Some(g) if g != *pos => {
                 if old_goal != Some(g) || mover.path.is_empty() {
-                    set_destination(&map, *pos, &mut mover, g);
+                    set_destination_avoiding(&map, *pos, &mut mover, g, avoid);
                 }
             }
             _ => mover.stop(),
@@ -472,11 +509,11 @@ mod tests {
         let from = TilePos::new(20, 20);
         // Enemy to the north: stay on the south side, against the wall.
         let (spot, _) =
-            best_spot(&map, from, 3, from, &HashSet::new(), &[threat(20, 32)], CoverMode::Engage { range: 12.0 }, &W).unwrap();
+            best_spot(&map, from, 3, from, &HashSet::new(), &HashSet::new(), &[threat(20, 32)], CoverMode::Engage { range: 12.0 }, &W).unwrap();
         assert_eq!(spot.y, 20, "south of the wall, got {spot:?}");
         // Enemy to the south: go around to the north side.
         let (spot, _) =
-            best_spot(&map, from, 3, from, &HashSet::new(), &[threat(20, 8)], CoverMode::Engage { range: 12.0 }, &W).unwrap();
+            best_spot(&map, from, 3, from, &HashSet::new(), &HashSet::new(), &[threat(20, 8)], CoverMode::Engage { range: 12.0 }, &W).unwrap();
         assert_eq!(spot.y, 22, "north of the wall, got {spot:?}");
     }
 
@@ -499,7 +536,7 @@ mod tests {
             Threat { pos: TilePos::new(20, 26), weight: 1.0 / (1.0 + 6.0 / 6.0), real: true },
             Threat { pos: TilePos::new(20, 5), weight: 1.0 / (1.0 + 15.0 / 6.0), real: true },
         ];
-        let (spot, _) = best_spot(&map, from, 3, from, &HashSet::new(), &threats, CoverMode::Hide, &W).unwrap();
+        let (spot, _) = best_spot(&map, from, 3, from, &HashSet::new(), &HashSet::new(), &threats, CoverMode::Hide, &W).unwrap();
         assert!(spot.y <= 20, "shelters from the nearer northern threat, got {spot:?}");
     }
 

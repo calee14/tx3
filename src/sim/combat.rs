@@ -15,8 +15,12 @@ use std::collections::HashMap;
 use bevy::prelude::*;
 use rand::Rng;
 
-use super::classes::{FighterClass, Traits};
-use super::fighter::{Condition, Decision, Fighter, Health, morale_baseline};
+use super::classes::{
+    ArmorClass, DamageType, Equipment, FighterClass, Loadout, Traits, damage_multiplier, suppression_multiplier,
+    weapon_damage_type,
+};
+use super::fighter::{Condition, Decision, Fighter, Health, XpLog, morale_baseline};
+use super::gadgets::unit_armor;
 use super::perception::Perception;
 use super::platoon::{Mission, Platoon};
 use super::{DT, Mover, SimRng, Unit, UnitClass, UnitId, UnitIndex};
@@ -29,7 +33,7 @@ pub struct ShotRecord {
     pub from: TilePos,
     pub to: TilePos,
     pub hit: bool,
-    pub shooter_class: FighterClass,
+    pub shooter: UnitClass,
 }
 
 #[derive(Resource, Default)]
@@ -121,6 +125,7 @@ struct Snapshot {
     mission: Option<Mission>,
     health: f32,
     armor: f32,
+    armor_class: ArmorClass,
     is_king: bool,
 }
 
@@ -135,6 +140,7 @@ type UnitQuery<'a> = (
     Option<&'a Perception>,
     &'a mut Health,
     Option<&'a mut Condition>,
+    Option<&'a mut Equipment>,
 );
 
 pub fn fire_weapons(
@@ -142,13 +148,15 @@ pub fn fire_weapons(
     map: Res<GameMap>,
     mut rng: ResMut<SimRng>,
     mut log: ResMut<ShotLog>,
+    mut xp: ResMut<XpLog>,
     platoons: Query<&Platoon>,
     mut units: Query<UnitQuery>,
 ) {
     let mission_of = |f: Option<&Fighter>| f.and_then(|f| platoons.get(f.platoon).ok()).map(|p| p.mission);
 
     let mut snaps: HashMap<Entity, Snapshot> = HashMap::new();
-    for (e, unit, _, pos, mover, fighter, _, _, health, _) in &units {
+    for (e, unit, _, pos, mover, fighter, _, _, health, _, _) in &units {
+        let (armor, armor_class) = unit_armor(unit.class);
         snaps.insert(
             e,
             Snapshot {
@@ -157,11 +165,8 @@ pub fn fire_weapons(
                 moving: !mover.path.is_empty(),
                 mission: mission_of(fighter),
                 health: health.frac(),
-                armor: match unit.class {
-                    UnitClass::Fighter(class) => class.stats().armor,
-                    UnitClass::Vehicle => super::vehicle::VEHICLE_ARMOR,
-                    UnitClass::King => 0.0,
-                },
+                armor,
+                armor_class,
                 is_king: unit.class == UnitClass::King,
             },
         );
@@ -171,15 +176,17 @@ pub fn fire_weapons(
         snaps.iter().filter(|(_, s)| !s.is_king).map(|(e, s)| (s.id, *e)).collect();
     shooters.sort();
 
-    // (target, damage, suppression, hit)
-    let mut effects: Vec<(Entity, f32, f32, bool)> = Vec::new();
+    // (shooter, target, damage, suppression, hit)
+    let mut effects: Vec<(Entity, Entity, f32, f32, bool)> = Vec::new();
 
     for (_, entity) in shooters {
-        let Ok((_, _, _, pos, _, Some(fighter), Some(traits), Some(perception), _, Some(mut cond))) =
+        let Ok((_, _, faction, pos, _, Some(fighter), Some(traits), Some(perception), _, Some(mut cond), mut equipment)) =
             units.get_mut(entity)
         else {
             continue;
         };
+        let loadout = equipment.as_ref().map_or(Loadout::Rifle, |e| e.loadout);
+        let damage_type = weapon_damage_type(fighter.class, loadout);
         cond.fire_cooldown -= DT;
         if cond.fire_cooldown > 0.0 || cond.decision == Decision::Retreating {
             continue;
@@ -240,20 +247,43 @@ pub fn fire_weapons(
 
         let hit = rng.0.random::<f32>() < p;
         let t = snaps[&target];
-        let damage = if hit { stats.damage * rng.0.random_range(0.8..1.2) * (1.0 - t.armor) } else { 0.0 };
-        let suppression = stats.suppression * if hit { 1.5 } else { 1.0 };
-        effects.push((target, damage, suppression, hit));
+        let damage = if hit {
+            stats.damage
+                * rng.0.random_range(0.8..1.2)
+                * damage_multiplier(damage_type, t.armor_class)
+                * (1.0 - t.armor)
+        } else {
+            0.0
+        };
+        let suppression = stats.suppression * suppression_multiplier(damage_type) * if hit { 1.5 } else { 1.0 };
+        effects.push((entity, target, damage, suppression, hit));
+
+        // A machine gun or armor-piercing hits give the loadout away.
+        if damage_type != DamageType::Standard
+            && (damage_type == DamageType::Suppression || hit)
+            && let Some(eq) = equipment.as_mut()
+        {
+            eq.known_to[faction.opponent().index()] = true;
+        }
 
         let ready_bonus = if me.mission == Some(Mission::Overwatch) && !me.moving { 0.8 } else { 1.0 };
-        cond.fire_cooldown = stats.fire_interval * rng.0.random_range(0.9..1.1) * ready_bonus;
+        // Carrying rockets means less machine-gun ammo: slower fire.
+        let loadout_mult = if loadout == Loadout::Rockets { 1.3 } else { 1.0 };
+        cond.fire_cooldown = stats.fire_interval * rng.0.random_range(0.9..1.1) * ready_bonus * loadout_mult;
         cond.fire_target = Some(target);
         cond.last_shot_tick = Some(tick.0);
-        log.0.push(ShotRecord { from: *pos, to: t.pos, hit, shooter_class: fighter.class });
+        log.0.push(ShotRecord { from: *pos, to: t.pos, hit, shooter: UnitClass::Fighter(fighter.class) });
     }
 
-    for (target, damage, suppression, hit) in effects {
-        let Ok((_, _, _, _, _, _, traits, _, mut health, cond)) = units.get_mut(target) else { continue };
+    for (shooter, target, damage, suppression, hit) in effects {
+        let Ok((_, _, _, _, _, _, traits, _, mut health, cond, _)) = units.get_mut(target) else { continue };
+        let was_alive = health.current > 0.0;
         health.current -= damage;
+        // Experience: damage dealt, plus a bonus for a kill.
+        let kill = if was_alive && health.current <= 0.0 { 4.0 } else { 0.0 };
+        if damage > 0.0 {
+            xp.0.push((shooter, damage / 10.0 + kill));
+        }
         if let (Some(mut cond), Some(traits)) = (cond, traits) {
             let steadiness = 1.0 - 0.4 * traits.brav();
             cond.suppression = (cond.suppression + suppression * steadiness).min(100.0);
@@ -314,6 +344,9 @@ pub fn remove_dead(
         }
         commands.entity(entity).despawn();
         index.entities.remove(&unit.id);
+        if matches!(unit.class, UnitClass::Gadget(_)) {
+            continue; // nobody mourns a turret
+        }
         if unit.class == UnitClass::King {
             outcome.ended = true;
             outcome.winner = Some(match faction {

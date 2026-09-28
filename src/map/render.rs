@@ -102,25 +102,30 @@ fn tile_pixel(map: &GameMap, pos: TilePos, lx: i32, ly: i32) -> Rgb {
     color
 }
 
+/// Paint one tile's pixels into the RGBA texture data.
+fn paint_tile(map: &GameMap, pos: TilePos, data: &mut [u8]) {
+    let w = (MAP_W * PX) as u32;
+    for ly in 0..PX {
+        for lx in 0..PX {
+            let c = tile_pixel(map, pos, lx, ly);
+            // Texture rows go top-down; the map's y goes bottom-up.
+            let px = (pos.x * PX + lx) as u32;
+            let py = ((MAP_H - 1 - pos.y) * PX + (PX - 1 - ly)) as u32;
+            let i = ((py * w + px) * 4) as usize;
+            for (k, channel) in c.iter().enumerate() {
+                data[i + k] = (channel.clamp(0.0, 1.0) * 255.0) as u8;
+            }
+            data[i + 3] = 255;
+        }
+    }
+}
+
 pub fn build_map_image(map: &GameMap) -> Image {
     let (w, h) = ((MAP_W * PX) as u32, (MAP_H * PX) as u32);
     let mut data = vec![0u8; (w * h * 4) as usize];
     for y in 0..MAP_H {
         for x in 0..MAP_W {
-            let pos = TilePos::new(x, y);
-            for ly in 0..PX {
-                for lx in 0..PX {
-                    let c = tile_pixel(map, pos, lx, ly);
-                    // Texture rows go top-down; the map's y goes bottom-up.
-                    let px = (x * PX + lx) as u32;
-                    let py = ((MAP_H - 1 - y) * PX + (PX - 1 - ly)) as u32;
-                    let i = ((py * w + px) * 4) as usize;
-                    for (k, channel) in c.iter().enumerate() {
-                        data[i + k] = (channel.clamp(0.0, 1.0) * 255.0) as u8;
-                    }
-                    data[i + 3] = 255;
-                }
-            }
+            paint_tile(map, TilePos::new(x, y), &mut data);
         }
     }
     let mut image = Image::new(
@@ -137,6 +142,7 @@ pub fn build_map_image(map: &GameMap) -> Image {
 /// Spawn the map sprite and sector labels for a new match.
 pub fn spawn_map_visuals(commands: &mut Commands, images: &mut Assets<Image>, map: &GameMap) {
     let handle = images.add(build_map_image(map));
+    commands.insert_resource(MapImage { handle: handle.clone(), painted: map.terrain_log.len() });
     commands.spawn((
         MatchEntity,
         Sprite {
@@ -156,6 +162,34 @@ pub fn spawn_map_visuals(commands: &mut Commands, images: &mut Assets<Image>, ma
             TextColor(Color::srgba(1.0, 1.0, 1.0, 0.35)),
             Transform::from_translation(sector.center_world().extend(Z_LABELS)),
         ));
+    }
+}
+
+/// The map texture, and how much of the terrain log it has painted.
+#[derive(Resource)]
+pub struct MapImage {
+    handle: Handle<Image>,
+    painted: usize,
+}
+
+/// Repaint tiles whose terrain changed during the match (a parked
+/// vehicle, a blown-up wall), plus their neighbors (outlines).
+pub fn repaint_changed_terrain(map: Res<GameMap>, image: Option<ResMut<MapImage>>, mut images: ResMut<Assets<Image>>) {
+    let Some(mut image) = image else { return };
+    if map.terrain_log.len() <= image.painted {
+        return;
+    }
+    let start = image.painted;
+    image.painted = map.terrain_log.len();
+    let Some(mut texture) = images.get_mut(&image.handle) else { return };
+    let Some(data) = texture.data.as_mut() else { return };
+    for &pos in &map.terrain_log[start..] {
+        for (dx, dy) in [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let p = pos.offset(dx, dy);
+            if p.in_bounds() {
+                paint_tile(&map, p, data);
+            }
+        }
     }
 }
 

@@ -6,8 +6,10 @@ use std::collections::{HashSet, VecDeque};
 use bevy::prelude::*;
 use rand::Rng;
 
-use super::classes::{FighterClass, Traits};
-use super::fighter::{Condition, Fighter, Health};
+use super::classes::{Equipment, FighterClass, Loadout, Traits};
+use super::economy::Supply;
+use super::fighter::{Condition, Fighter, Health, Veterancy, Work, WorkKind};
+use super::gadgets::GadgetKind;
 use super::perception::{Perception, Vision};
 use super::{DT, Mover, SIM_HZ, SimInterp, SimTick, Unit, UnitClass, UnitIndex};
 use crate::faction::Faction;
@@ -25,7 +27,7 @@ pub const CONFUSION_FREEZE: f32 = 85.0;
 /// How long a signal takes to travel from the King to a platoon. Until it
 /// arrives the platoon carries on with its current orders, so commanding
 /// is about planning and positioning, not reflexes.
-pub const SIGNAL_TRAVEL_SECONDS: f32 = 0.5;
+pub const SIGNAL_TRAVEL_SECONDS: f32 = 1.0;
 pub const SIGNAL_TRAVEL_TICKS: u64 = (SIGNAL_TRAVEL_SECONDS * SIM_HZ as f32) as u64;
 
 /// A signal on its way from the King to a platoon.
@@ -39,6 +41,9 @@ pub struct SignalInFlight {
     pub from: TilePos,
     pub sent_tick: u64,
     pub arrive_tick: u64,
+    /// A build order for the platoon's engineer instead of a mission
+    /// (with the Supply already paid, refunded if nobody can build it).
+    pub build: Option<(GadgetKind, f32)>,
 }
 
 /// Signals sent but not yet received, oldest first.
@@ -56,8 +61,10 @@ impl SignalsInFlight {
 pub fn deliver_signals(
     tick: Res<SimTick>,
     mut flight: ResMut<SignalsInFlight>,
+    mut supply: ResMut<Supply>,
     mut platoons: Query<&mut Platoon>,
     traits: Query<&Traits>,
+    mut engineers: Query<(&Fighter, &TilePos, &mut Condition)>,
 ) {
     if flight.0.is_empty() {
         return;
@@ -68,9 +75,34 @@ pub fn deliver_signals(
     for s in arrived {
         let Ok(mut platoon) = platoons.get_mut(s.platoon) else { continue };
         let leadership = platoon.leader.and_then(|l| traits.get(l).ok()).map_or(0.0, |t| t.lead());
-        receive_signal(&mut platoon, s.mission, s.target, tick.0, leadership);
+        let Some((kind, paid)) = s.build else {
+            receive_signal(&mut platoon, s.mission, s.target, tick.0, leadership);
+            continue;
+        };
+        // A build order: a signal like any other (adds some confusion), for
+        // the platoon's free engineer nearest the site.
+        platoon.confusion = (platoon.confusion + BUILD_SIGNAL_CONFUSION * (1.25 - 0.5 * leadership)).min(100.0);
+        platoon.last_signal_tick = Some(tick.0);
+        let builder = platoon
+            .members
+            .iter()
+            .filter(|m| engineers.get(**m).is_ok_and(|(f, _, c)| f.class == FighterClass::Engineer && c.work.is_none()))
+            .min_by(|a, b| {
+                let d = |e: &Entity| engineers.get(*e).map_or(f32::MAX, |(_, p, _)| p.distance(s.target));
+                d(a).total_cmp(&d(b)).then(a.cmp(b))
+            })
+            .copied();
+        match builder.and_then(|b| engineers.get_mut(b).ok()) {
+            Some((_, _, mut cond)) => {
+                cond.work = Some(Work { kind: WorkKind::Build(kind), tile: s.target, progress: 0.0, paid, idle: 0.0 });
+            }
+            None => supply.0[s.issuer.index()] += paid,
+        }
     }
 }
+
+/// Confusion added by an engineer build order.
+pub const BUILD_SIGNAL_CONFUSION: f32 = 12.0;
 
 /// How far an assaulting platoon advances per bound, in tiles.
 const ASSAULT_BOUND: usize = 7;
@@ -391,10 +423,19 @@ pub fn spawn_king(commands: &mut Commands, index: &mut UnitIndex, map: &GameMap,
 pub struct Recruit {
     pub class: FighterClass,
     pub traits: Traits,
+    /// Hidden equipment, rolled at purchase.
+    pub loadout: Loadout,
 }
 
 pub fn roll_recruits(classes: &[FighterClass], rng: &mut impl Rng) -> Vec<Recruit> {
-    classes.iter().map(|&class| Recruit { class, traits: Traits::roll(&class.stats().traits, rng) }).collect()
+    classes
+        .iter()
+        .map(|&class| Recruit {
+            class,
+            traits: Traits::roll(&class.stats().traits, rng),
+            loadout: Loadout::roll(class, rng),
+        })
+        .collect()
 }
 
 /// Everything needed to put a new platoon on the field.
@@ -447,6 +488,8 @@ pub fn spawn_platoon(
                 recruit.traits,
                 Health::new(stats.max_health),
                 Condition::new(&recruit.traits),
+                Equipment::new(recruit.loadout, faction.index()),
+                Veterancy::default(),
             ))
             .id();
         index.entities.insert(id, fighter);
