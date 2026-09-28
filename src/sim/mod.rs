@@ -27,7 +27,7 @@ use rand_chacha::ChaCha8Rng;
 use crate::faction::Faction;
 use crate::map::{GameMap, TilePos};
 use crate::pathfinding::find_path;
-use classes::{FighterClass, Traits};
+use classes::FighterClass;
 use combat::{MatchOutcome, ShotLog};
 use platoon::{Mission, Platoon, PlatoonId};
 
@@ -42,6 +42,7 @@ impl Plugin for SimPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(Time::<Fixed>::from_hz(SIM_HZ))
             .init_resource::<ShotLog>()
+            .init_resource::<platoon::SignalsInFlight>()
             .configure_sets(
                 FixedUpdate,
                 (
@@ -69,7 +70,13 @@ impl Plugin for SimPlugin {
             .add_systems(
                 FixedUpdate,
                 (
-                    (advance_tick, economy::accrue_supply, process_commands, economy::process_deployments)
+                    (
+                        advance_tick,
+                        economy::accrue_supply,
+                        process_commands,
+                        platoon::deliver_signals,
+                        economy::process_deployments,
+                    )
                         .chain()
                         .in_set(SimSet::Commands),
                     platoon::update_platoons.in_set(SimSet::Platoons),
@@ -305,8 +312,9 @@ pub fn process_commands(
     index: Res<UnitIndex>,
     map: Res<GameMap>,
     mut units: Query<(&Faction, &TilePos, &mut Mover), With<Unit>>,
-    mut platoons: Query<(&Faction, &mut Platoon)>,
-    traits: Query<&Traits>,
+    platoons: Query<(Entity, &Faction), With<Platoon>>,
+    kings: Query<(&Unit, &Faction, &TilePos)>,
+    mut flight: ResMut<platoon::SignalsInFlight>,
 ) {
     for command in queue.take_matching(|c| matches!(c, SimCommand::Move { .. } | SimCommand::Signal { .. })) {
         match command {
@@ -323,13 +331,26 @@ pub fn process_commands(
             }
             SimCommand::Signal { issuer, platoon, mission, target } => {
                 let Some(&entity) = index.platoons.get(&platoon) else { continue };
-                let Ok((faction, mut platoon)) = platoons.get_mut(entity) else { continue };
+                let Ok((_, faction)) = platoons.get(entity) else { continue };
                 if *faction != issuer {
                     warn!("{issuer:?} tried to signal a {faction:?} platoon; ignored");
                     continue;
                 }
-                let leadership = platoon.leader.and_then(|l| traits.get(l).ok()).map_or(0.0, |t| t.lead());
-                platoon::receive_signal(&mut platoon, mission, target, tick.0, leadership);
+                // The signal travels to the platoon; it's received (and
+                // adds confusion) when it arrives.
+                let from = kings
+                    .iter()
+                    .find(|(u, f, _)| u.class == UnitClass::King && **f == issuer)
+                    .map_or(target, |(_, _, p)| *p);
+                flight.0.push(platoon::SignalInFlight {
+                    issuer,
+                    platoon: entity,
+                    mission,
+                    target,
+                    from,
+                    sent_tick: tick.0,
+                    arrive_tick: tick.0 + platoon::SIGNAL_TRAVEL_TICKS,
+                });
             }
             _ => {}
         }

@@ -22,6 +22,56 @@ pub const CONFUSION_HIGH: f32 = 70.0;
 /// Confusion at or above this freezes the platoon: it stops following its
 /// mission (fighters still defend themselves).
 pub const CONFUSION_FREEZE: f32 = 85.0;
+/// How long a signal takes to travel from the King to a platoon. Until it
+/// arrives the platoon carries on with its current orders, so commanding
+/// is about planning and positioning, not reflexes.
+pub const SIGNAL_TRAVEL_SECONDS: f32 = 0.5;
+pub const SIGNAL_TRAVEL_TICKS: u64 = (SIGNAL_TRAVEL_SECONDS * SIM_HZ as f32) as u64;
+
+/// A signal on its way from the King to a platoon.
+#[derive(Clone, Debug)]
+pub struct SignalInFlight {
+    pub issuer: Faction,
+    pub platoon: Entity,
+    pub mission: Mission,
+    pub target: TilePos,
+    /// Where the King was when it sent the signal (for the visual pulse).
+    pub from: TilePos,
+    pub sent_tick: u64,
+    pub arrive_tick: u64,
+}
+
+/// Signals sent but not yet received, oldest first.
+#[derive(Resource, Default, Debug)]
+pub struct SignalsInFlight(pub Vec<SignalInFlight>);
+
+impl SignalsInFlight {
+    pub fn heading_to(&self, platoon: Entity) -> Option<&SignalInFlight> {
+        self.0.iter().rev().find(|s| s.platoon == platoon)
+    }
+}
+
+/// Deliver signals that have reached their platoon. Confusion counts from
+/// the moment a signal arrives.
+pub fn deliver_signals(
+    tick: Res<SimTick>,
+    mut flight: ResMut<SignalsInFlight>,
+    mut platoons: Query<&mut Platoon>,
+    traits: Query<&Traits>,
+) {
+    if flight.0.is_empty() {
+        return;
+    }
+    let (arrived, travelling): (Vec<SignalInFlight>, Vec<SignalInFlight>) =
+        std::mem::take(&mut flight.0).into_iter().partition(|s| s.arrive_tick <= tick.0);
+    flight.0 = travelling;
+    for s in arrived {
+        let Ok(mut platoon) = platoons.get_mut(s.platoon) else { continue };
+        let leadership = platoon.leader.and_then(|l| traits.get(l).ok()).map_or(0.0, |t| t.lead());
+        receive_signal(&mut platoon, s.mission, s.target, tick.0, leadership);
+    }
+}
+
 /// How far an assaulting platoon advances per bound, in tiles.
 const ASSAULT_BOUND: usize = 7;
 /// An assaulting platoon bounds forward after this long even if not

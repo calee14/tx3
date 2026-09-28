@@ -71,6 +71,7 @@ pub fn setup_simulation(commands: &mut Commands, seed: u64) -> crate::map::GameM
     commands.insert_resource(Supply::default());
     commands.insert_resource(SetupLog::default());
     commands.insert_resource(Territory::new(&map));
+    commands.insert_resource(crate::sim::platoon::SignalsInFlight::default());
     // The AI commands the side the local player isn't on.
     commands.insert_resource(crate::termbot::AiCommanders::new(&[Faction::Termbots]));
     commands.insert_resource(SimRng(rng));
@@ -241,6 +242,32 @@ mod tests {
         assert!(shots_a > 20, "the commanders should find each other ({shots_a} shots)");
         assert_eq!(shots_a, shots_b);
         assert_eq!(side_summary(&mut a), side_summary(&mut b));
+    }
+
+    #[test]
+    fn signals_take_half_a_second_to_arrive() {
+        use crate::sim::platoon::{Mission, Platoon};
+        let mut app = headless_app(42);
+        run_ticks(&mut app, 2);
+        let world = app.world_mut();
+        let (entity, id) = world
+            .query::<(Entity, &Faction, &Platoon)>()
+            .iter(world)
+            .find(|(_, f, _)| **f == Faction::Humans)
+            .map(|(e, _, p)| (e, p.id))
+            .unwrap();
+        world.resource_mut::<CommandQueue>().push(crate::sim::SimCommand::Signal {
+            issuer: Faction::Humans,
+            platoon: id,
+            mission: Mission::Assault,
+            target: TilePos::new(60, 40),
+        });
+        let mission = |app: &mut App| app.world().get::<Platoon>(entity).unwrap().mission;
+        run_ticks(&mut app, 9);
+        assert_eq!(mission(&mut app), Mission::Overwatch, "still on its way after 0.45 s");
+        assert_eq!(app.world().get::<Platoon>(entity).unwrap().confusion, 0.0, "no confusion before it arrives");
+        run_ticks(&mut app, 2);
+        assert_eq!(mission(&mut app), Mission::Assault, "received after 0.5 s");
     }
 
     /// Run ticks, returning the number of shots fired.

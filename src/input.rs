@@ -4,8 +4,9 @@
 //! Giving a signal: left-click any fighter to select its platoon, pick a
 //! mission (buttons at the bottom, or keys 1 / 2 / 3), then right-click
 //! the target. Right-clicking without picking a mission keeps the
-//! platoon's current mission with a new target. Every signal adds a
-//! little confusion to the platoon, so don't spam.
+//! platoon's current mission with a new target. Signals take 0.5 s to
+//! reach the platoon, and every signal adds a little confusion, so don't
+//! spam.
 //!
 //! The King is selected and moved the same way, without missions.
 
@@ -19,7 +20,9 @@ use crate::army_panel::ArmyBuilder;
 use crate::fog::FogOfWar;
 use crate::map::GameMap;
 use crate::sim::economy::MatchPhase;
+use crate::sim::SimTick;
 use crate::sim::fighter::Fighter;
+use crate::sim::platoon::{SIGNAL_TRAVEL_TICKS, SignalsInFlight};
 use crate::sim::platoon::{Mission, Platoon};
 use crate::sim::{CommandQueue, Mover, SimCommand, Unit, UnitClass};
 
@@ -44,6 +47,7 @@ impl Plugin for InputPlugin {
                         draw_selection,
                         update_orders_panel,
                         draw_placement_preview,
+                        draw_signals_in_flight,
                     )
                         .chain()
                         .run_if(resource_exists::<CommandQueue>)
@@ -303,6 +307,7 @@ fn draw_selection(
 
 fn update_orders_panel(
     phase: Res<MatchPhase>,
+    flight: Res<SignalsInFlight>,
     selection: Res<Selection>,
     pending: Res<PendingMission>,
     platoons: Query<&Platoon>,
@@ -327,7 +332,9 @@ fn update_orders_panel(
         platoon.confusion,
         platoon.confusion_label()
     );
-    if let Some(p) = platoon.pending {
+    if let Some(s) = flight.heading_to(e) {
+        line.push_str(&format!("\nSignal on its way: {}", s.mission.name()));
+    } else if let Some(p) = platoon.pending {
         line.push_str(&format!("\nOrder received, not acted on yet: {}", p.mission.name()));
     }
     line.push_str(&match pending.0 {
@@ -335,6 +342,35 @@ fn update_orders_panel(
         None => "\nPick a mission, then right-click a target".to_string(),
     });
     text.0 = line;
+}
+
+/// Your signals travelling from the King to their platoons: a pulse moving
+/// along a faint line (the enemy's signals are invisible).
+fn draw_signals_in_flight(
+    flight: Res<SignalsInFlight>,
+    tick: Res<SimTick>,
+    fixed: Res<Time<Fixed>>,
+    local: Res<LocalPlayer>,
+    platoons: Query<&Platoon>,
+    transforms: Query<&Transform>,
+    mut gizmos: Gizmos,
+) {
+    let travel = SIGNAL_TRAVEL_TICKS.max(1) as f32;
+    for s in flight.0.iter().filter(|s| s.issuer == local.0) {
+        let from = s.from.to_world();
+        let to = platoons
+            .get(s.platoon)
+            .ok()
+            .and_then(|p| p.leader.or(p.members.first().copied()))
+            .and_then(|m| transforms.get(m).ok())
+            .map_or(s.target.to_world(), |t| t.translation.truncate());
+        let t = ((tick.0.saturating_sub(s.sent_tick)) as f32 + fixed.overstep_fraction()) / travel;
+        let pulse = from.lerp(to, t.clamp(0.0, 1.0));
+        let color = Color::srgb(0.6, 0.95, 1.0);
+        gizmos.line_2d(from, to, color.with_alpha(0.25));
+        gizmos.circle_2d(Isometry2d::from_translation(pulse), 4.0, color);
+        gizmos.circle_2d(Isometry2d::from_translation(pulse), 2.0, color);
+    }
 }
 
 /// While a platoon is being built: show where it would go, green if the

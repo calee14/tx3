@@ -74,7 +74,7 @@ Run the tests with `cargo test`.
 | F | Debug view: fog off, plus the Termbot commander's thoughts |
 | N | New map (next seed) |
 
-Every signal adds confusion to the platoon, and contradictory signals in quick succession add a lot. Confused platoons act on orders late, and very confused ones freeze.
+Signals take **0.5 s** to travel from your King to the platoon; a small pulse shows each one on its way. Until it arrives, the platoon keeps doing what it was doing, so plan ahead rather than reacting to every enemy move. Every signal also adds confusion when it arrives, and contradictory signals in quick succession add a lot. Confused platoons act on orders late, and very confused ones freeze.
 
 **Overhead icons:** `RUN` broken · `??` frozen · `!!` pinned · `?` confused · `!` suppressed · `++`/`+` injured · `~` shaken · `^` brave. Gold diamond = platoon leader. Cyan streaks are sniper shots.
 
