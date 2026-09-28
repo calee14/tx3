@@ -30,6 +30,9 @@ pub struct Perception {
     pub visible_tiles: Vec<TilePos>,
     /// Enemy units this unit can currently see.
     pub seen_enemies: Vec<Entity>,
+    visible_set: HashSet<TilePos>,
+    /// Where the visible tiles were computed from (recomputed on move).
+    computed_at: Option<TilePos>,
 }
 
 /// Is there a clear line of sight from `from` to `to`?
@@ -108,21 +111,32 @@ fn for_each_line_tile(a: TilePos, b: TilePos, mut f: impl FnMut(TilePos)) {
 
 pub fn update_perception(
     map: Res<GameMap>,
-    mut viewers: Query<(Entity, &Faction, &TilePos, &Vision, &mut Perception)>,
-    targets: Query<(Entity, &Faction, &TilePos), With<Unit>>,
+    mut viewers: Query<(&Faction, &TilePos, &Vision, &mut Perception)>,
+    targets: Query<(Entity, &Faction, &TilePos, &Unit)>,
 ) {
-    for (_, faction, pos, vision, mut perception) in &mut viewers {
-        let tiles = visible_tiles(&map, *pos, vision.radius);
-        let visible: HashSet<TilePos> = tiles.iter().copied().collect();
-        let seen_enemies = targets
+    // Stable order so fighters' target lists (and so their random rolls)
+    // are the same on every machine.
+    let mut all_targets: Vec<(Entity, Faction, TilePos, super::UnitId)> =
+        targets.iter().map(|(e, f, p, u)| (e, *f, *p, u.id)).collect();
+    all_targets.sort_by_key(|t| t.3);
+
+    for (faction, pos, vision, mut perception) in &mut viewers {
+        // Terrain doesn't change, so sight only needs recomputing on move.
+        if perception.computed_at != Some(*pos) {
+            let tiles = visible_tiles(&map, *pos, vision.radius);
+            let p = perception.as_mut();
+            p.visible_set = tiles.iter().copied().collect();
+            p.visible_tiles = tiles;
+            p.computed_at = Some(*pos);
+        }
+        let seen_enemies: Vec<Entity> = all_targets
             .iter()
-            .filter(|(_, f, p)| **f != *faction && visible.contains(p))
-            .map(|(e, _, _)| e)
+            .filter(|(_, f, p, _)| f != faction && perception.visible_set.contains(p))
+            .map(|(e, _, _, _)| *e)
             .collect();
         // Only touch the component when something changed, so the fog
         // system (which watches for changes) stays idle otherwise.
-        if perception.visible_tiles != tiles || perception.seen_enemies != seen_enemies {
-            perception.visible_tiles = tiles;
+        if perception.seen_enemies != seen_enemies {
             perception.seen_enemies = seen_enemies;
         }
     }

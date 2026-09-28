@@ -1,6 +1,7 @@
 //! The commander's fog of war, tracked per tile.
 //!
-//! - Each side starts with the area around its own King revealed.
+//! - Each side starts with a large circle around its own King revealed,
+//!   reaching a little past the middle of the map.
 //! - Fighters uncover the map as they move: any tile a fighter sees becomes
 //!   explored for its commander, permanently.
 //! - Enemy units on explored tiles are shown plainly (no silhouettes).
@@ -25,8 +26,11 @@ pub const Z_FOG: f32 = 5.0;
 /// Opacity of unexplored ground. Terrain stays faintly visible: maps are
 /// mirrored, so players can infer it from their own half anyway.
 const FOG_ALPHA: u8 = 248;
-/// Radius (in tiles) around each King that starts out explored.
-pub const START_REVEAL_RADIUS: f32 = 18.0;
+/// Radius (in tiles) around each King that starts out explored. Kings
+/// start 56 tiles from the middle line, so this covers most of your own
+/// half and peeks about 6 tiles into the enemy's: the opening glimpse of
+/// what you're facing.
+pub const START_REVEAL_RADIUS: f32 = 63.0;
 
 pub struct FogPlugin;
 

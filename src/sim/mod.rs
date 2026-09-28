@@ -4,12 +4,18 @@
 //! replays possible later):
 //! - Runs only in `FixedUpdate`, at a fixed tick rate, never per frame.
 //! - Only changes state in response to ticks and `SimCommand`s. Player
-//!   input, the Termbot AI and (later) the network all push commands into
-//!   the same `CommandQueue`.
-//! - All randomness comes from `SimRng`, seeded per match.
+//!   input, the Termbot commander and (later) the network all push
+//!   commands into the same `CommandQueue`.
+//! - All randomness comes from `SimRng`, seeded per match, and is used in
+//!   a fixed order (units sorted by `UnitId`).
 //! - Rendering reads sim state but never writes it.
 
+pub mod ai;
+pub mod classes;
+pub mod combat;
+pub mod fighter;
 pub mod perception;
+pub mod platoon;
 
 use std::collections::{HashMap, VecDeque};
 
@@ -19,27 +25,48 @@ use rand_chacha::ChaCha8Rng;
 use crate::faction::Faction;
 use crate::map::{GameMap, TilePos};
 use crate::pathfinding::find_path;
+use classes::{FighterClass, Traits};
+use combat::{MatchOutcome, ShotLog};
+use platoon::{Mission, Platoon, PlatoonId};
 
 /// Simulation ticks per second.
 pub const SIM_HZ: f64 = 20.0;
+/// Seconds per tick. The sim always uses this, never wall-clock time.
+pub const DT: f32 = 1.0 / SIM_HZ as f32;
 
 pub struct SimPlugin;
 
 impl Plugin for SimPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(Time::<Fixed>::from_hz(SIM_HZ))
+            .init_resource::<ShotLog>()
             .configure_sets(
                 FixedUpdate,
-                (SimSet::Commands, SimSet::Movement, SimSet::Perception, SimSet::Intel, SimSet::Record)
+                (
+                    SimSet::Commands,
+                    SimSet::Platoons,
+                    SimSet::Perception,
+                    SimSet::Decide,
+                    SimSet::Movement,
+                    SimSet::Combat,
+                    SimSet::Aftermath,
+                    SimSet::Intel,
+                    SimSet::Record,
+                )
                     .chain()
-                    .run_if(resource_exists::<GameMap>),
+                    .run_if(resource_exists::<GameMap>)
+                    .run_if(match_running),
             )
             .add_systems(
                 FixedUpdate,
                 (
                     (advance_tick, process_commands).chain().in_set(SimSet::Commands),
-                    move_units.in_set(SimSet::Movement),
+                    platoon::update_platoons.in_set(SimSet::Platoons),
                     perception::update_perception.in_set(SimSet::Perception),
+                    ai::decide.in_set(SimSet::Decide),
+                    move_units.in_set(SimSet::Movement),
+                    combat::fire_weapons.in_set(SimSet::Combat),
+                    (combat::update_conditions, combat::remove_dead).chain().in_set(SimSet::Aftermath),
                     record_interpolation.in_set(SimSet::Record),
                 ),
             )
@@ -47,25 +74,36 @@ impl Plugin for SimPlugin {
     }
 }
 
+fn match_running(outcome: Option<Res<MatchOutcome>>) -> bool {
+    outcome.is_none_or(|o| o.winner.is_none())
+}
+
 /// Stages of one simulation tick, in order.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SimSet {
-    /// Apply queued commands (player signals, AI decisions).
+    /// Apply queued commands (player signals, AI commander decisions).
     Commands,
-    /// Move units along their paths.
-    Movement,
+    /// Platoons: leaders, confusion, delayed orders, assault bounds.
+    Platoons,
     /// Each unit works out what it can see.
     Perception,
-    /// Update each commander's knowledge (sector fog) from perception.
+    /// Each fighter decides what to do (autonomy).
+    Decide,
+    /// Move units along their paths.
+    Movement,
+    /// Fighters shoot at what they see.
+    Combat,
+    /// Morale, suppression recovery, deaths.
+    Aftermath,
+    /// Update each commander's knowledge (fog) from perception.
     Intel,
     /// Snapshot positions for smooth rendering between ticks.
     Record,
 }
 
 /// The match's random number generator. All sim randomness (trait rolls,
-/// hit chances, ...) must come from here so matches are reproducible.
+/// hit chances, decisions) must come from here so matches are reproducible.
 #[derive(Resource)]
-#[allow(dead_code)] // first used by trait rolls in step 2
 pub struct SimRng(pub ChaCha8Rng);
 
 /// Number of simulation ticks since the match started.
@@ -77,11 +115,13 @@ pub struct SimTick(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct UnitId(pub u32);
 
-/// Lookup from `UnitId` to the local ECS entity.
+/// Lookup from stable ids to local ECS entities.
 #[derive(Resource, Default)]
 pub struct UnitIndex {
     pub entities: HashMap<UnitId, Entity>,
+    pub platoons: HashMap<PlatoonId, Entity>,
     next_id: u32,
+    next_platoon: u32,
 }
 
 impl UnitIndex {
@@ -90,13 +130,21 @@ impl UnitIndex {
         self.next_id += 1;
         id
     }
+
+    pub fn allocate_platoon(&mut self) -> PlatoonId {
+        let id = PlatoonId(self.next_platoon);
+        self.next_platoon += 1;
+        id
+    }
 }
 
 /// Everything that can change the game goes through a command.
 #[derive(Clone, Debug)]
 pub enum SimCommand {
-    /// Move a unit (or later, a platoon leader) to a tile.
+    /// Move a single unit (the King) to a tile.
     Move { issuer: Faction, unit: UnitId, target: TilePos },
+    /// The King signals a platoon: a mission and where to carry it out.
+    Signal { issuer: Faction, platoon: PlatoonId, mission: Mission, target: TilePos },
 }
 
 /// Commands waiting for the next tick. Commands issued while the game is
@@ -115,12 +163,21 @@ impl CommandQueue {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnitClass {
     King,
+    Fighter(FighterClass),
 }
 
 impl UnitClass {
     pub fn name(self) -> &'static str {
         match self {
             UnitClass::King => "King",
+            UnitClass::Fighter(class) => class.stats().name,
+        }
+    }
+
+    pub fn letter(self) -> &'static str {
+        match self {
+            UnitClass::King => "K",
+            UnitClass::Fighter(class) => class.stats().letter,
         }
     }
 }
@@ -141,11 +198,39 @@ pub struct Mover {
     pub progress: f32,
     /// Tiles per second on open ground.
     pub speed: f32,
+    /// Situational multiplier (sprinting, crawling while suppressed, ...).
+    pub speed_mult: f32,
 }
 
 impl Mover {
     pub fn new(speed: f32) -> Self {
-        Self { path: VecDeque::new(), progress: 0.0, speed }
+        Self { path: VecDeque::new(), progress: 0.0, speed, speed_mult: 1.0 }
+    }
+
+    /// Stop after finishing the current step (so movement stays smooth).
+    pub fn stop(&mut self) {
+        if self.progress > 0.0 {
+            self.path.truncate(1);
+        } else {
+            self.path.clear();
+        }
+    }
+}
+
+/// Plan a path to `goal`. If the unit is mid-step, it finishes that step
+/// first and plans from the tile it's stepping into.
+pub fn set_destination(map: &GameMap, pos: TilePos, mover: &mut Mover, goal: TilePos) -> bool {
+    let mid_step = mover.progress > 0.0 && !mover.path.is_empty();
+    let start = if mid_step { mover.path[0] } else { pos };
+    match find_path(map, start, goal) {
+        Some(mut path) => {
+            if mid_step {
+                path.push_front(start);
+            }
+            mover.path = path;
+            true
+        }
+        None => false,
     }
 }
 
@@ -166,11 +251,14 @@ fn advance_tick(mut tick: ResMut<SimTick>) {
     tick.0 += 1;
 }
 
-fn process_commands(
+pub fn process_commands(
     mut queue: ResMut<CommandQueue>,
+    tick: Res<SimTick>,
     index: Res<UnitIndex>,
     map: Res<GameMap>,
-    mut units: Query<(&Faction, &TilePos, &mut Mover)>,
+    mut units: Query<(&Faction, &TilePos, &mut Mover), With<Unit>>,
+    mut platoons: Query<(&Faction, &mut Platoon)>,
+    traits: Query<&Traits>,
 ) {
     for command in queue.pending.drain(..) {
         match command {
@@ -181,36 +269,40 @@ fn process_commands(
                     warn!("{issuer:?} tried to command a {faction:?} unit; ignored");
                     continue;
                 }
-                // If the unit is mid-step, finish that step first so its
-                // movement stays smooth, and plan from the tile it's
-                // stepping into.
-                let mid_step = mover.progress > 0.0 && !mover.path.is_empty();
-                let start = if mid_step { mover.path[0] } else { *pos };
-                match find_path(&map, start, target) {
-                    Some(mut path) => {
-                        if mid_step {
-                            path.push_front(start);
-                        }
-                        mover.path = path;
-                    }
-                    None => debug!("no path from {start:?} to {target:?}"),
+                if !set_destination(&map, *pos, &mut mover, target) {
+                    debug!("no path from {pos:?} to {target:?}");
                 }
+            }
+            SimCommand::Signal { issuer, platoon, mission, target } => {
+                let Some(&entity) = index.platoons.get(&platoon) else { continue };
+                let Ok((faction, mut platoon)) = platoons.get_mut(entity) else { continue };
+                if *faction != issuer {
+                    warn!("{issuer:?} tried to signal a {faction:?} platoon; ignored");
+                    continue;
+                }
+                let leadership = platoon.leader.and_then(|l| traits.get(l).ok()).map_or(0.0, |t| t.lead());
+                platoon::receive_signal(&mut platoon, mission, target, tick.0, leadership);
             }
         }
     }
 }
 
-fn move_units(time: Res<Time>, map: Res<GameMap>, mut units: Query<(&mut TilePos, &mut Mover)>) {
-    let dt = time.delta_secs();
+fn move_units(map: Res<GameMap>, mut units: Query<(&mut TilePos, &mut Mover)>) {
     for (mut pos, mut mover) in &mut units {
         let Some(&next) = mover.path.front() else {
             mover.progress = 0.0;
             continue;
         };
+        if !map.can_step(*pos, next) {
+            // Path went stale; stop and let the unit re-plan.
+            mover.path.clear();
+            mover.progress = 0.0;
+            continue;
+        }
         let diagonal = next.x != pos.x && next.y != pos.y;
         let step_length = if diagonal { std::f32::consts::SQRT_2 } else { 1.0 };
         let cost = map.tile(next).move_cost() as f32 * step_length;
-        mover.progress += mover.speed * dt / cost;
+        mover.progress += mover.speed * mover.speed_mult * DT / cost;
         if mover.progress >= 1.0 {
             *pos = next;
             mover.path.pop_front();
