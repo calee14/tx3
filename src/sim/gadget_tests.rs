@@ -380,3 +380,35 @@ fn breaching_charges_crack_the_rock_an_enemy_hides_behind() {
     );
     assert_ne!(app.world().resource::<GameMap>().tile(rock).feature, Feature::Rock, "rock breached");
 }
+
+/// Ticks from the build order until the turret stands, for a platoon of
+/// `n` engineers (all with the same loadout, so only numbers differ).
+fn turret_build_ticks(n: usize) -> u32 {
+    let mut app = sandbox();
+    let members = squad(&mut app, H, &vec![FighterClass::Engineer; n], TilePos::new(40, 30), Mission::Overwatch);
+    for m in &members {
+        *app.world_mut().get_mut::<Equipment>(*m).unwrap() = Equipment::new(Loadout::Toolkit, 0);
+    }
+    let platoon = app.world().get::<super::fighter::Fighter>(members[0]).unwrap().platoon;
+    let id = app.world().get::<Platoon>(platoon).unwrap().id;
+    push(&mut app, SimCommand::Build { issuer: H, platoon: id, kind: GadgetKind::Turret, target: TilePos::new(41, 33) });
+    for t in 1..=20 * 30 {
+        run(&mut app, 1);
+        let world = app.world_mut();
+        if world.query::<&Gadget>().iter(world).count() > 0 {
+            return t;
+        }
+    }
+    panic!("turret never built with {n} engineers");
+}
+
+#[test]
+fn more_engineers_build_faster() {
+    let one = turret_build_ticks(1);
+    let three = turret_build_ticks(3);
+    // Turret: 8 s of work, Toolkit x1.6 -> 5 s alone, about 1.7 s for three
+    // (plus walking to the site either way).
+    assert!(three + 40 < one, "1 engineer: {one} ticks, 3 engineers: {three} ticks");
+    eprintln!("turret build: 1 engineer {one} ticks, 3 engineers {three} ticks");
+    assert!(one >= 100, "a lone engineer takes at least 5 s: {one}");
+}

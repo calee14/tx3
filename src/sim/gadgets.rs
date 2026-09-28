@@ -920,7 +920,15 @@ type EngineerQuery<'a> = (
     &'a mut Equipment,
 );
 
-/// Engineers at work: building at the site, defusing next to a trap. Also
+/// Build speed of one engineer (a Toolkit works 60% faster).
+pub fn work_speed(loadout: Loadout) -> f32 {
+    if loadout == Loadout::Toolkit { 1.6 } else { 1.0 }
+}
+
+/// Engineers at work: building at the site, defusing next to a trap.
+/// Engineers from the same platoon help with a build: each one working
+/// next to the site adds its own speed, so two engineers build twice as
+/// fast, three three times as fast. Also
 /// hands out their own jobs: defusing known traps nearby, and (Mine
 /// layers) planting mines in front of a holding platoon.
 #[allow(clippy::too_many_arguments)]
@@ -951,12 +959,34 @@ pub fn update_engineers(
             sites.insert(tile);
         }
     }
+    // Help each lead engineer is getting right now: helpers next to the
+    // site, standing still and not pinned.
+    let mut help: std::collections::HashMap<Entity, f32> = std::collections::HashMap::new();
+    for e in engineers.iter() {
+        let (pos, mover, cond, eq) = (e.3, e.5, &e.7, &e.8);
+        if let Some(Work { kind: WorkKind::Assist(lead), tile, .. }) = cond.work
+            && pos.distance(tile) <= 1.5
+            && mover.path.is_empty()
+            && cond.suppression < PINNED
+            && cond.decision != Decision::Retreating
+        {
+            *help.entry(lead).or_default() += work_speed(eq.loadout);
+        }
+    }
+    // Leads and their jobs, so helpers know when to stop.
+    let leads: std::collections::HashMap<Entity, TilePos> = engineers
+        .iter()
+        .filter_map(|e| match e.7.work {
+            Some(Work { kind: WorkKind::Build(_), tile, .. }) => Some((e.0, tile)),
+            _ => None,
+        })
+        .collect();
 
     for (_, entity) in order {
         let Ok((_, _, faction, pos, fighter, mover, perception, mut cond, mut eq)) = engineers.get_mut(entity) else {
             continue;
         };
-        let speed = if eq.loadout == Loadout::Toolkit { 1.6 } else { 1.0 };
+        let speed = work_speed(eq.loadout);
         let seen_by_enemy = viewers.iter().any(|(f, p)| *f != *faction && p.seen_enemies.contains(&entity));
 
         if let Some(mut work) = cond.work {
@@ -979,7 +1009,8 @@ pub fn update_engineers(
                     let at_site = *pos == work.tile && mover.path.is_empty();
                     if at_site {
                         if cond.suppression < PINNED {
-                            work.progress += DT * speed / kind.stats().build_seconds;
+                            let team = speed + help.get(&entity).copied().unwrap_or(0.0);
+                            work.progress += DT * team / kind.stats().build_seconds;
                         }
                     } else if mover.path.is_empty() && cond.decision == Decision::Building {
                         work.idle += DT; // can't get there
@@ -998,6 +1029,17 @@ pub fn update_engineers(
                     } else {
                         cond.work = Some(work);
                     }
+                }
+                WorkKind::Assist(lead) => {
+                    // Done when the lead's build is finished or abandoned.
+                    if leads.get(&lead) != Some(&work.tile) {
+                        cond.work = None;
+                        continue;
+                    }
+                    if pos.distance(work.tile) > 1.5 && mover.path.is_empty() && cond.decision == Decision::Building {
+                        work.idle += DT;
+                    }
+                    cond.work = if work.idle > 4.0 { None } else { Some(work) };
                 }
                 WorkKind::Defuse(trap) => {
                     let Ok((_, trap_unit, _, _, _)) = gadgets.get(trap) else {

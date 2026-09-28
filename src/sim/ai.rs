@@ -366,6 +366,8 @@ pub fn decide(
                 WorkKind::Build(_) => (Decision::Building, Some(work.tile)),
                 WorkKind::Defuse(_) if pos.distance(work.tile) <= 1.5 => (Decision::Defusing, None),
                 WorkKind::Defuse(_) => (Decision::Defusing, work_spot(&map, work.tile, *pos, &taken)),
+                WorkKind::Assist(_) if pos.distance(work.tile) <= 1.5 => (Decision::Building, None),
+                WorkKind::Assist(_) => (Decision::Building, work_spot(&map, work.tile, *pos, &taken)),
             }
         } else {
             let at_slot = pos.distance(slot) <= 1.5;

@@ -121,6 +121,8 @@ pub struct Work {
 pub enum WorkKind {
     Build(super::gadgets::GadgetKind),
     Defuse(Entity),
+    /// Helping the platoon's lead engineer (this entity) with its build.
+    Assist(Entity),
 }
 
 impl Condition {

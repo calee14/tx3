@@ -499,6 +499,7 @@ fn update_orders_panel(
             let what = match work.kind {
                 WorkKind::Build(kind) => format!("building a {}", kind.stats().name),
                 WorkKind::Defuse(_) => "defusing a trap".to_string(),
+                WorkKind::Assist(_) => "helping build".to_string(),
             };
             line.push_str(&format!("\nEngineer {what} ({:.0}%)", work.progress * 100.0));
         }

@@ -79,8 +79,7 @@ pub fn deliver_signals(
             receive_signal(&mut platoon, s.mission, s.target, tick.0, leadership);
             continue;
         };
-        // A build order: a signal like any other (adds some confusion), for
-        // the platoon's free engineer nearest the site.
+        // A build order: a signal like any other (adds some confusion).
         platoon.confusion = (platoon.confusion + BUILD_SIGNAL_CONFUSION * (1.25 - 0.5 * leadership)).min(100.0);
         platoon.last_signal_tick = Some(tick.0);
         let builder = platoon
@@ -92,11 +91,23 @@ pub fn deliver_signals(
                 d(a).total_cmp(&d(b)).then(a.cmp(b))
             })
             .copied();
-        match builder.and_then(|b| engineers.get_mut(b).ok()) {
-            Some((_, _, mut cond)) => {
-                cond.work = Some(Work { kind: WorkKind::Build(kind), tile: s.target, progress: 0.0, paid, idle: 0.0 });
-            }
-            None => supply.0[s.issuer.index()] += paid,
+        let Some(builder) = builder else {
+            supply.0[s.issuer.index()] += paid;
+            continue;
+        };
+        // The nearest free engineer leads; the platoon's other free
+        // engineers come and help, each one speeding up the build.
+        let free: Vec<Entity> = platoon
+            .members
+            .iter()
+            .copied()
+            .filter(|m| engineers.get(*m).is_ok_and(|(f, _, c)| f.class == FighterClass::Engineer && c.work.is_none()))
+            .collect();
+        for m in free {
+            let Ok((_, _, mut cond)) = engineers.get_mut(m) else { continue };
+            let kind = if m == builder { WorkKind::Build(kind) } else { WorkKind::Assist(builder) };
+            let paid = if m == builder { paid } else { 0.0 };
+            cond.work = Some(Work { kind, tile: s.target, progress: 0.0, paid, idle: 0.0 });
         }
     }
 }
