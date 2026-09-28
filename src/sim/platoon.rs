@@ -24,6 +24,9 @@ pub const CONFUSION_HIGH: f32 = 70.0;
 pub const CONFUSION_FREEZE: f32 = 85.0;
 /// How far an assaulting platoon advances per bound, in tiles.
 const ASSAULT_BOUND: usize = 7;
+/// An assaulting platoon bounds forward after this long even if not
+/// everyone has caught up (10 s).
+const BOUND_TIMEOUT_TICKS: u64 = 200;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Mission {
@@ -79,6 +82,8 @@ pub struct Platoon {
     /// Supply paid for this platoon (refunded if placement is undone
     /// during setup).
     pub paid: f32,
+    /// Tick of the last assault bound (or when the assault began).
+    pub last_bound_tick: u64,
 }
 
 /// Largest allowed platoon.
@@ -160,6 +165,7 @@ pub fn update_platoons(
     map: Res<GameMap>,
     mut platoons: Query<(Entity, &mut Platoon)>,
     members: Query<(&Unit, &TilePos, &Traits), With<Fighter>>,
+    slots: Query<(&TilePos, &Fighter, &Faction)>,
 ) {
     for (entity, mut platoon) in &mut platoons {
         platoon.members.retain(|&m| members.get(m).is_ok());
@@ -191,6 +197,7 @@ pub fn update_platoons(
             && tick.0 >= pending.apply_tick
         {
             platoon.pending = None;
+            platoon.last_bound_tick = tick.0;
             platoon.mission = pending.mission;
             platoon.target = pending.target;
             platoon.anchor = match pending.mission {
@@ -200,15 +207,20 @@ pub fn update_platoons(
             };
         }
 
-        // Assault: once most of the platoon reaches the anchor, bound forward.
+        // Assault: once most of the platoon has reached its places around the
+        // anchor, bound forward. Fighters may settle into cover a few tiles
+        // from their exact slot, so "arrived" is measured against each
+        // fighter's own slot; and a bound never waits more than 10 s.
         if platoon.mission == Mission::Assault && platoon.anchor != platoon.target {
             let arrived = platoon
                 .members
                 .iter()
-                .filter_map(|&m| members.get(m).ok())
-                .filter(|(_, p, _)| p.distance(platoon.anchor) <= 4.0)
+                .filter_map(|&m| slots.get(m).ok())
+                .filter(|(p, f, faction)| p.distance(slot_tile(platoon.anchor, f.slot, **faction)) <= 4.5)
                 .count();
-            if arrived * 2 >= platoon.members.len() {
+            let waited_too_long = tick.0.saturating_sub(platoon.last_bound_tick) > BOUND_TIMEOUT_TICKS;
+            if arrived * 2 >= platoon.members.len() || waited_too_long {
+                platoon.last_bound_tick = tick.0;
                 if let Some(path) = find_path(&map, platoon.anchor, platoon.target) {
                     platoon.anchor = path.get(ASSAULT_BOUND - 1).or(path.back()).copied().unwrap_or(platoon.target);
                 } else {
@@ -216,8 +228,26 @@ pub fn update_platoons(
                 }
             }
         }
+
+        // Reposition: once most of the platoon has arrived, it digs in and
+        // watches (Overwatch at the same spot). Not a signal, so no confusion.
+        if platoon.mission == Mission::Reposition && platoon.pending.is_none() {
+            let arrived = platoon
+                .members
+                .iter()
+                .filter_map(|&m| members.get(m).ok())
+                .filter(|(_, p, _)| p.distance(platoon.target) <= REPOSITION_ARRIVED)
+                .count();
+            if arrived * 2 >= platoon.members.len() {
+                platoon.mission = Mission::Overwatch;
+                platoon.anchor = platoon.target;
+            }
+        }
     }
 }
+
+/// A repositioning fighter this close to the target counts as arrived.
+const REPOSITION_ARRIVED: f32 = 3.5;
 
 /// The walkable tile closest to the platoon's average position.
 fn centroid_tile(
@@ -386,6 +416,7 @@ pub fn spawn_platoon(
         last_signal_tick: None,
         pending: None,
         paid: new.paid,
+        last_bound_tick: 0,
     });
     index.platoons.insert(platoon_id, platoon_entity);
     (platoon_entity, members)
@@ -408,6 +439,7 @@ mod tests {
             last_signal_tick: None,
             pending: None,
             paid: 0.0,
+            last_bound_tick: 0,
         }
     }
 

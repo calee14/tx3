@@ -119,6 +119,14 @@ impl Feature {
     }
 }
 
+/// The 8 neighboring directions: E, W, N, S, NE, SE, NW, SW.
+pub const DIRS8: [(i32, i32); 8] = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)];
+/// An obstacle protects against shots whose direction is within this cosine
+/// of the direction to the obstacle (0.8 = about 37 degrees either side).
+/// A straight neighbor covers straight-on shots, a diagonal one covers
+/// diagonal shots, and a corner (both) covers everything in between.
+const COVER_FACING: f32 = 0.8;
+
 /// How protected a unit standing on a tile is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CoverLevel {
@@ -314,10 +322,55 @@ impl GameMap {
         }
     }
 
-    /// Protection for a unit standing on `pos`: heavy next to a rock or
-    /// wall, light in sandbags or trees.
+    /// Protection a unit on `target` has against fire coming from `from`.
+    ///
+    /// Cover is directional: a rock, wall or parked vehicle only protects
+    /// if it's on the neighboring tile facing the shooter (within ~37
+    /// degrees), and a sandbag line in front gives light cover the same way.
+    /// Standing in sandbags or trees gives light cover from every side.
+    pub fn cover_against(&self, target: TilePos, from: TilePos) -> CoverLevel {
+        let toward = Vec2::new((from.x - target.x) as f32, (from.y - target.y) as f32);
+        let mut best = match self.tile(target).feature {
+            Feature::LightCover | Feature::Trees => CoverLevel::Light,
+            _ => CoverLevel::None,
+        };
+        if toward.length_squared() < 0.25 {
+            return best;
+        }
+        let toward = toward.normalize();
+        for (dx, dy) in DIRS8 {
+            let n = target.offset(dx, dy);
+            if !n.in_bounds() || Vec2::new(dx as f32, dy as f32).normalize().dot(toward) < COVER_FACING {
+                continue;
+            }
+            match self.tile(n).feature {
+                f if f.is_solid() => return CoverLevel::Heavy,
+                Feature::LightCover => best = best.max(CoverLevel::Light),
+                _ => {}
+            }
+        }
+        best
+    }
+
+    /// Compass directions (N, NE, ...) in which `pos` has a solid obstacle
+    /// right next to it, i.e. directions it has heavy cover from.
+    pub fn cover_facings(&self, pos: TilePos) -> Vec<&'static str> {
+        const NAMES: [&str; 8] = ["E", "W", "N", "S", "NE", "SE", "NW", "SW"];
+        DIRS8
+            .iter()
+            .zip(NAMES)
+            .filter(|((dx, dy), _)| {
+                let n = pos.offset(*dx, *dy);
+                n.in_bounds() && self.tile(n).feature.is_solid()
+            })
+            .map(|(_, name)| name)
+            .collect()
+    }
+
+    /// The best protection `pos` offers from any direction (used when no
+    /// threat direction is known).
     pub fn cover_at(&self, pos: TilePos) -> CoverLevel {
-        let beside_obstacle = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        let beside_obstacle = DIRS8
             .into_iter()
             .map(|(dx, dy)| pos.offset(dx, dy))
             .any(|n| n.in_bounds() && self.tile(n).feature.is_solid());
@@ -336,5 +389,43 @@ impl GameMap {
         DIRS.iter()
             .map(move |&(dx, dy)| pos.offset(dx, dy))
             .filter(move |&n| self.can_step(pos, n))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flat_map() -> GameMap {
+        let mut map = generate::generate_map(5);
+        for t in &mut map.tiles {
+            *t = Tile::default();
+        }
+        map
+    }
+
+    #[test]
+    fn obstacles_only_cover_the_side_they_are_on() {
+        let mut map = flat_map();
+        let me = TilePos::new(20, 20);
+        map.tile_mut(me.offset(0, 1)).feature = Feature::Rock; // rock to the north
+        assert_eq!(map.cover_against(me, TilePos::new(20, 30)), CoverLevel::Heavy); // shot from N
+        assert_eq!(map.cover_against(me, TilePos::new(23, 30)), CoverLevel::Heavy); // from NNE
+        assert_eq!(map.cover_against(me, TilePos::new(26, 26)), CoverLevel::None); // from NE: exposed
+        assert_eq!(map.cover_against(me, TilePos::new(30, 20)), CoverLevel::None); // from E
+        assert_eq!(map.cover_against(me, TilePos::new(20, 10)), CoverLevel::None); // from S
+        assert_eq!(map.cover_at(me), CoverLevel::Heavy);
+        assert_eq!(map.cover_facings(me), vec!["N"]);
+    }
+
+    #[test]
+    fn sandbags_in_front_give_light_cover_and_trees_cover_all_round() {
+        let mut map = flat_map();
+        let me = TilePos::new(20, 20);
+        map.tile_mut(me.offset(1, 0)).feature = Feature::LightCover;
+        assert_eq!(map.cover_against(me, TilePos::new(30, 21)), CoverLevel::Light);
+        assert_eq!(map.cover_against(me, TilePos::new(10, 20)), CoverLevel::None);
+        map.tile_mut(me).feature = Feature::Trees;
+        assert_eq!(map.cover_against(me, TilePos::new(10, 20)), CoverLevel::Light);
     }
 }

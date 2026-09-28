@@ -39,7 +39,9 @@ pub struct Perception {
 /// Is there a clear line of sight from `from` to `to`?
 ///
 /// Blocked by any tile in between that is higher than the viewer (ledges
-/// block sight from below), or by looking too deep into a forest. The
+/// block sight from below), by rocks and walls (except ones hugged by the
+/// viewer or target, which they can peek over), or by looking too deep
+/// into a forest. The
 /// target tile itself is always visible if the line reaches it, so a unit
 /// can see the edge of a plateau or the treeline.
 pub fn line_of_sight(map: &GameMap, from: TilePos, to: TilePos) -> bool {
@@ -55,8 +57,10 @@ pub fn line_of_sight(map: &GameMap, from: TilePos, to: TilePos) -> bool {
             blocked = true;
         }
         // Rocks and walls block sight, unless you look down on them from
-        // higher ground.
-        if tile.feature.is_solid() && tile.elevation >= viewer_elevation {
+        // higher ground, or the obstacle is right next to the viewer or the
+        // target: you can peek over or around cover you're hugging.
+        let hugged = chebyshev(p, from) <= 1 || chebyshev(p, to) <= 1;
+        if tile.feature.is_solid() && tile.elevation >= viewer_elevation && !hugged {
             blocked = true;
         }
         if tile.feature == Feature::Trees {
@@ -67,6 +71,10 @@ pub fn line_of_sight(map: &GameMap, from: TilePos, to: TilePos) -> bool {
         }
     });
     !blocked
+}
+
+fn chebyshev(a: TilePos, b: TilePos) -> i32 {
+    (a.x - b.x).abs().max((a.y - b.y).abs())
 }
 
 /// All tiles visible from `from` for a unit with the given base radius.
@@ -189,6 +197,20 @@ mod tests {
         map.tile_mut(TilePos::new(10, 10)).elevation = 1;
         map.tile_mut(TilePos::new(11, 10)).elevation = 1;
         assert!(line_of_sight(&map, TilePos::new(10, 10), TilePos::new(15, 10)));
+    }
+
+    #[test]
+    fn fighters_can_peek_over_cover_they_hug() {
+        let mut map = flat_map();
+        map.tile_mut(TilePos::new(11, 10)).feature = Feature::Wall;
+        // Viewer hugging the wall sees past it...
+        assert!(line_of_sight(&map, TilePos::new(10, 10), TilePos::new(18, 10)));
+        // ...and a target hugging the wall's far side can be seen too.
+        map.tile_mut(TilePos::new(11, 10)).feature = Feature::None;
+        map.tile_mut(TilePos::new(17, 10)).feature = Feature::Wall;
+        assert!(line_of_sight(&map, TilePos::new(10, 10), TilePos::new(18, 10)));
+        // But a unit two tiles behind the wall is hidden.
+        assert!(!line_of_sight(&map, TilePos::new(10, 10), TilePos::new(19, 10)));
     }
 
     #[test]

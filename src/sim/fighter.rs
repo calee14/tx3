@@ -84,6 +84,9 @@ pub struct Condition {
     pub fire_target: Option<Entity>,
     /// Tick of its next decision. Smarter fighters think more often.
     pub next_think: u64,
+    /// Cover it has right now against the threats it knows about
+    /// (directional; updated when it re-thinks).
+    pub cover: CoverLevel,
 }
 
 impl Condition {
@@ -96,6 +99,7 @@ impl Condition {
             goal: None,
             fire_target: None,
             next_think: 0,
+            cover: CoverLevel::None,
         }
     }
 }

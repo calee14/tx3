@@ -201,7 +201,7 @@ pub fn fire_weapons(
                 shooter_health: me.health,
                 shooter_mission: me.mission,
                 shooter_elevation: map.tile(*pos).elevation,
-                target_cover: map.cover_at(t.pos),
+                target_cover: map.cover_against(t.pos, *pos),
                 target_moving: t.moving,
                 target_mission: t.mission,
                 target_elevation: map.tile(t.pos).elevation,
@@ -263,14 +263,13 @@ pub fn fire_weapons(
 /// Suppression wears off; morale drifts toward a level set by bravery,
 /// health, incoming fire and whether the platoon leader is nearby.
 pub fn update_conditions(
-    map: Res<GameMap>,
     territory: Option<Res<super::economy::Territory>>,
     platoons: Query<&Platoon>,
     leaders: Query<(&TilePos, &Traits)>,
     mut fighters: Query<(&TilePos, &Faction, &Fighter, &Traits, &Health, &mut Condition)>,
 ) {
     for (pos, faction, fighter, traits, health, mut cond) in &mut fighters {
-        let decay = if map.cover_at(*pos) != CoverLevel::None { 28.0 } else { 18.0 };
+        let decay = if cond.cover != CoverLevel::None { 28.0 } else { 18.0 };
         cond.suppression = (cond.suppression - decay * DT).max(0.0);
 
         let mut target = morale_baseline(traits) - cond.suppression * 0.3 - (1.0 - health.frac()) * 20.0

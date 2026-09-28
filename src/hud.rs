@@ -128,7 +128,16 @@ fn update_hud(
             sector.name,
             map::elevation_name(t.elevation),
             t.feature.name(),
-            if t.passable() { map.cover_at(tile).name() } else { "impassable" }
+            if !t.passable() {
+                "impassable".to_string()
+            } else {
+                let facings = map.cover_facings(tile);
+                if facings.is_empty() {
+                    map.cover_at(tile).name().to_string()
+                } else {
+                    format!("heavy cover from {}", facings.join(" "))
+                }
+            }
         );
         if t.ramp {
             desc.push_str("  Ramp");
@@ -162,7 +171,6 @@ type HoverQuery<'a> = (
 
 #[allow(clippy::too_many_arguments)]
 fn update_tooltip(
-    map: Res<GameMap>,
     cursor: Res<CursorWorld>,
     fog: Res<FogOfWar>,
     debug: Res<FogDebug>,
@@ -183,7 +191,7 @@ fn update_tooltip(
             .map(|(_, u)| u)
     });
     let (node, visibility) = &mut *tooltip;
-    let Some((entity, unit, faction, pos, _, health, mover, fighter, traits, cond, vehicle)) = hovered else {
+    let Some((entity, unit, faction, _, _, health, mover, fighter, traits, cond, vehicle)) = hovered else {
         **visibility = Visibility::Hidden;
         return;
     };
@@ -230,7 +238,7 @@ fn update_tooltip(
 
     if let Some(c) = cond {
         let confusion = platoon.map_or(0.0, |p| p.confusion);
-        let list: Vec<&str> = statuses(c, health, confusion, !mover.path.is_empty(), map.cover_at(*pos))
+        let list: Vec<&str> = statuses(c, health, confusion, !mover.path.is_empty(), c.cover)
             .into_iter()
             .filter(|s| own || s.visible_to_enemy())
             .map(|s| s.name())

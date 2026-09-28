@@ -53,7 +53,7 @@ Run the tests with `cargo test`.
 | 1 / 2 / 3, or the buttons | Choose a mission: Assault / Overwatch / Reposition |
 | Right-click | Signal the selected platoon: the chosen mission (or its current one) at that tile. Moves the King if it's selected |
 | Hover a fighter | Details: your fighters show traits, morale, suppression and what they're doing; enemies show only what's visible |
-| Hover a tile | The HUD shows its terrain and cover |
+| Hover a tile | The HUD shows its terrain and the directions it has heavy cover from |
 | WASD / arrow keys / middle-mouse drag | Pan the camera |
 | Mouse wheel | Zoom |
 | Space | Pause / resume (single-player only). Orders given while paused apply on resume |
@@ -66,14 +66,14 @@ Every signal adds confusion to the platoon, and contradictory signals in quick s
 
 ## What's in it
 
-- **Mirrored procedural maps.** 128×128 tiles, symmetric under a 180° rotation so both sides get identical terrain. The terrain has three elevation levels with ledges and ramps, and forests. Obstacles include ruined buildings with doorways, rock outcrops, concrete barrier walls, boulders and sandbag lines. Rocks and walls are solid: they block movement and sight, and a unit standing next to one gets heavy cover. Sandbags and trees give light cover. Every map is validated: every walkable tile is reachable, and no high ground overlooks a spawn. A seed that fails validation is rerolled.
+- **Mirrored procedural maps.** 128×128 tiles, symmetric under a 180° rotation so both sides get identical terrain. The terrain has three elevation levels with ledges and ramps, and forests. Obstacles include ruined buildings with doorways, rock outcrops, concrete barrier walls, boulders and sandbag lines. Rocks and walls are solid: they block movement and sight. **Cover is directional:** an obstacle next to a fighter gives heavy cover only against shots from that side (within about 37°). Fighters can peek over cover they're hugging. Sandbags and trees give light cover. Every map is validated: every walkable tile is reachable, and no high ground overlooks a spawn. A seed that fails validation is rerolled.
 - **12 sectors** (A1–C4), used for territory control. Rows 1–2 are the Humans' half and rows 3–4 are the Termbots'.
 - **Two layers of knowledge.** Each unit has its own vision: radius-based, extended by high ground, blocked by higher ledges, rocks, walls and forest depth. The commander's fog is per tile. Each side starts with a large circle around its King revealed, peeking a few tiles past the middle, and every tile a unit sees stays explored. Enemy units show up only on explored ground.
 - **Platoons.** 1–5 fighters of any classes, with call signs Alpha, Bravo, and so on. Fighters roll Accuracy, IQ, Tactics, Bravery and Leadership within their class's range. The best leader leads, and the next one steps up if they fall.
 - **Economy.** 1000 starting Supply, +3/s for both sides. Base prices: Assaulter 50, Heavy Weapons 80, Sniper 90, Juggernaut 120, and +150 to deliver by vehicle. Each living fighter of a class raises that class's price by 25%.
 - **Vehicles.** A vehicle drives at 6 tiles/s, has armor and can be shot on the way. On arrival it unloads its platoon in Overwatch and parks as a solid, cover-giving obstacle. If it's destroyed on the way, the passengers bail out hurt and shaken, and the wreck becomes the obstacle.
-- **Missions.** Assault bounds toward the target cover to cover; Overwatch holds in cover with reaction fire; Reposition sprints and dodges. The three form a rock-paper-scissors loop through hit-chance modifiers.
-- **Fighter autonomy.** Each fighter re-thinks several times a second. Broken fighters flee, pinned fighters stay down, and frozen platoons stop following orders. Otherwise, fighters score taking cover, advancing, fighting or holding, from what they see and their state, tilted by their traits. They shoot on their own at whatever they see, with penalties for moving, suppression and injury.
+- **Missions.** Assault bounds toward the target cover to cover; Overwatch holds in cover with reaction fire; Reposition sprints and dodges, then switches to Overwatch once it arrives. The three form a rock-paper-scissors loop through hit-chance modifiers. Enemy missions are never shown: you read them from how the enemy moves and fires.
+- **Fighter autonomy.** Each fighter re-thinks several times a second. Broken fighters flee, pinned fighters stay down, and frozen platoons stop following orders. Otherwise, fighters score taking cover, advancing, fighting or holding, from what they see and their state, tilted by their traits. They choose cover that puts obstacles between themselves and the enemies their platoon knows about, weighting closer threats more. They pick spots they can shoot from when engaging, and out of sight when hurt or pinned. They shoot on their own at whatever they see, with penalties for moving, suppression and injury.
 - **Combat.** Health, armor, suppression, morale, deaths, and leader succession. Killing the enemy King wins.
 - **Simulation architecture built for multiplayer.** Game logic runs in `FixedUpdate` at 20 ticks per second, headless-capable. Every change goes through a `CommandQueue` of `SimCommand`s, addressed by stable `UnitId`s. Randomness comes from a seeded `SimRng`. Rendering interpolates between ticks, so tile-to-tile movement looks smooth.
 
@@ -113,7 +113,7 @@ Game logic (map generation, pathfinding, line of sight) has no rendering code an
 
 ## Tests
 
-`cargo test` also runs headless matches. They check that setup places both armies, that a vehicle delivers its platoon and parks as an obstacle, that the timer ends the match on territory, and that the same seed replays a two-minute battle identically. For a balance summary across a few seeds, run `cargo test battle_report -- --ignored --nocapture`.
+`cargo test` also runs headless matches. They check that setup places both armies, that a vehicle delivers its platoon and parks as an obstacle, that the timer ends the match on territory, and that the same seed replays a two-minute battle identically. Debug reports: `cargo test battle_report -- --ignored --nocapture` (battle summary per seed), `cargo test cover_report -- --ignored --nocapture` (how often fighters in contact are in cover), and `SEED=42 SECS=90 cargo test fighter_report -- --ignored --nocapture` (every fighter's state at a moment).
 
 ## Next: step 5
 

@@ -231,6 +231,64 @@ mod tests {
         }
     }
 
+    /// Debug: what every fighter is doing after `secs` seconds.
+    /// `SEED=1234 SECS=120 cargo test fighter_report -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn fighter_report() {
+        use crate::sim::fighter::{Condition, Fighter};
+        let seed = std::env::var("SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(1234);
+        let secs: u32 = std::env::var("SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
+        let mut app = headless_app(seed);
+        run_ticks(&mut app, secs * 20);
+        let world = app.world_mut();
+        let mut rows: Vec<String> = world
+            .query::<(&Unit, &Faction, &TilePos, &Fighter, &Condition, &Health, &crate::sim::perception::Perception)>()
+            .iter(world)
+            .map(|(u, f, p, fi, c, h, per)| {
+                format!(
+                    "{:?} {:?} {:?} at ({},{}) {:?} cover={:?} supp={:.0} morale={:.0} hp={:.0} sees={} target={:?}",
+                    u.id.0, f, fi.class, p.x, p.y, c.decision, c.cover, c.suppression, c.morale, h.current,
+                    per.seen_enemies.len(), c.goal
+                )
+            })
+            .collect();
+        rows.sort();
+        for r in rows {
+            eprintln!("{r}");
+        }
+        for p in world.query::<(&Faction, &crate::sim::platoon::Platoon)>().iter(world) {
+            eprintln!("{:?} {} {:?} target={:?} anchor={:?} n={}", p.0, p.1.name, p.1.mission, p.1.target, p.1.anchor, p.1.members.len());
+        }
+    }
+
+    /// Debug: how often fighters in contact are in cover, sampled every 2 s.
+    /// `cargo test cover_report -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn cover_report() {
+        use crate::map::CoverLevel;
+        use crate::sim::fighter::Condition;
+        for seed in [42u64, 7, 1234] {
+            let mut app = headless_app(seed);
+            let mut counts = [0u32; 3];
+            for _ in 0..90 {
+                run_ticks(&mut app, 40);
+                let world = app.world_mut();
+                for (c, per) in world.query::<(&Condition, &crate::sim::perception::Perception)>().iter(world) {
+                    if !per.seen_enemies.is_empty() {
+                        counts[match c.cover {
+                            CoverLevel::None => 0,
+                            CoverLevel::Light => 1,
+                            CoverLevel::Heavy => 2,
+                        }] += 1;
+                    }
+                }
+            }
+            eprintln!("seed {seed}: fighters in contact -> no cover {}, light {}, heavy {}", counts[0], counts[1], counts[2]);
+        }
+    }
+
     #[test]
     fn battle_happens_and_is_deterministic() {
         let (a, shots_a) = run_headless(42, 120);

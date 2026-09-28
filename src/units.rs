@@ -11,7 +11,7 @@ use bevy::prelude::*;
 
 use crate::faction::{Faction, LocalPlayer};
 use crate::fog::{FogDebug, FogOfWar};
-use crate::map::{GameMap, TilePos};
+use crate::map::TilePos;
 use crate::sim::classes::FighterClass;
 use crate::sim::combat::ShotLog;
 use crate::sim::fighter::{Condition, Fighter, Health, statuses};
@@ -101,16 +101,14 @@ fn shown(fog: &FogOfWar, debug: &FogDebug, local: LocalPlayer, faction: Faction,
 }
 
 fn update_status_icons(
-    map: Option<Res<GameMap>>,
     local: Res<LocalPlayer>,
     platoons: Query<&Platoon>,
-    fighters: Query<(&Faction, &TilePos, &Fighter, &Condition, &Health, &Mover, &Children)>,
+    fighters: Query<(&Faction, &Fighter, &Condition, &Health, &Mover, &Children)>,
     mut icons: Query<(&mut Text2d, &mut TextColor), With<StatusIcons>>,
 ) {
-    let Some(map) = map else { return };
-    for (faction, pos, fighter, cond, health, mover, children) in &fighters {
+    for (faction, fighter, cond, health, mover, children) in &fighters {
         let confusion = platoons.get(fighter.platoon).map_or(0.0, |p| p.confusion);
-        let all = statuses(cond, health, confusion, !mover.path.is_empty(), map.cover_at(*pos));
+        let all = statuses(cond, health, confusion, !mover.path.is_empty(), cond.cover);
         // Enemies only show what can be seen from outside.
         let visible: Vec<_> =
             all.into_iter().filter(|s| *faction == local.0 || s.visible_to_enemy()).filter_map(|s| s.icon()).collect();
