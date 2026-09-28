@@ -42,8 +42,9 @@ impl TilePos {
         Self { x, y }
     }
 
-    /// The matching tile on the other side of the map. Maps are symmetric
-    /// under a 180-degree rotation, so both sides get identical terrain.
+    /// The matching tile on the other side of the map (180-degree
+    /// rotation). Used for spawns and sector layout, which stay symmetric
+    /// even though the terrain is random.
     pub const fn mirrored(self) -> Self {
         Self::new(MAP_W - 1 - self.x, MAP_H - 1 - self.y)
     }

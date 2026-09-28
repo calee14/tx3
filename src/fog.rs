@@ -23,9 +23,10 @@ use crate::sim::perception::Perception;
 use crate::sim::{SimSet, Unit};
 
 pub const Z_FOG: f32 = 5.0;
-/// Opacity of unexplored ground. Terrain stays faintly visible: maps are
-/// mirrored, so players can infer it from their own half anyway.
-const FOG_ALPHA: u8 = 248;
+/// Opacity of unexplored ground. Fully dark: maps are random, so the
+/// terrain there is unknown until someone scouts it. (Lower this, e.g. to
+/// 248, to show a faint outline of the terrain under the fog.)
+const FOG_ALPHA: u8 = 255;
 /// Radius (in tiles) around each King that starts out explored. Kings
 /// start 56 tiles from the middle line, so this covers most of your own
 /// half and peeks about 6 tiles into the enemy's: the opening glimpse of

@@ -1,6 +1,6 @@
 //! Termbots vs Humans: a real-time 2D strategy commander game.
 //!
-//! Steps 1-4 of the build order: a procedurally generated, mirrored map,
+//! Steps 1-4 of the build order: a procedurally generated, balanced map,
 //! fog of war, and the fixed-timestep simulation; platoons of 1-5 fighters
 //! with rolled traits, missions, signals and confusion, and autonomous
 //! fighters; Supply, a hidden setup phase, reinforcements on foot or by

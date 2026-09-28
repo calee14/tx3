@@ -3,7 +3,7 @@
 A real-time 2D strategy commander game built with Rust and [Bevy](https://bevy.org) 0.19.
 
 This covers **steps 1–4 and 7** of the build order in the design doc:
-- a procedurally generated mirrored map with fog of war
+- a procedurally generated random (but balanced) map with fog of war
 - platoons of 1–5 fighters with rolled traits
 - missions and signals with confusion
 - autonomous fighters that move, shoot, take cover and flee on their own
@@ -80,9 +80,9 @@ Every signal adds confusion to the platoon, and contradictory signals in quick s
 
 ## What's in it
 
-- **Mirrored procedural maps.** 128×128 tiles, symmetric under a 180° rotation so both sides get identical terrain. The terrain has three elevation levels with ledges and ramps, and forests. Obstacles include ruined buildings with doorways, rock outcrops, concrete barrier walls, boulders and sandbag lines. Rocks and walls are solid: they block movement and sight. **Cover is directional:** an obstacle next to a fighter gives heavy cover only against shots from that side (within about 37°). Fighters can peek over cover they're hugging. Sandbags and trees give light cover. Every map is validated: every walkable tile is reachable, and no high ground overlooks a spawn. A seed that fails validation is rerolled.
+- **Random, balanced maps.** 128×128 tiles, fully random rather than mirrored. Each half gets the same share of hills, high ground and forest, and the same number of each kind of obstacle. Maps whose halves still differ too much are rerolled. The terrain has three elevation levels with ledges and ramps, and forests. Obstacles include ruined buildings with doorways, rock outcrops, concrete barrier walls, boulders and sandbag lines. Rocks and walls are solid: they block movement and sight. **Cover is directional:** an obstacle next to a fighter gives heavy cover only against shots from that side (within about 37°). Fighters can peek over cover they're hugging. Sandbags and trees give light cover. Every map is validated: every walkable tile is reachable, no high ground overlooks a spawn, and the halves are balanced. A seed that fails validation is rerolled.
 - **12 sectors** (A1–C4), used for territory control. Rows 1–2 are the Humans' half and rows 3–4 are the Termbots'.
-- **Two layers of knowledge.** Each unit has its own vision: radius-based, extended by high ground, blocked by higher ledges, rocks, walls and forest depth. The commander's fog is per tile. Each side starts with a large circle around its King revealed, peeking a few tiles past the middle, and every tile a unit sees stays explored. Enemy units show up only on explored ground.
+- **Two layers of knowledge.** Each unit has its own vision: radius-based, extended by high ground, blocked by higher ledges, rocks, walls and forest depth. The commander's fog is per tile. Each side starts with a large circle around its King revealed, peeking a few tiles past the middle, and every tile a unit sees stays explored. Unexplored ground is completely dark. Enemy units show up only on explored ground.
 - **Platoons.** 1–5 fighters of any classes, with call signs Alpha, Bravo, and so on. Fighters roll Accuracy, IQ, Tactics, Bravery and Leadership within their class's range. The best leader leads, and the next one steps up if they fall.
 - **Economy.** 1000 starting Supply, +3/s for both sides. Base prices: Assaulter 50, Heavy Weapons 80, Sniper 90, Juggernaut 120, and +150 to deliver by vehicle. Each living fighter of a class raises that class's price by 25%.
 - **Vehicles.** A vehicle drives at 6 tiles/s, has armor and can be shot on the way. On arrival it unloads its platoon in Overwatch and parks as a solid, cover-giving obstacle. If it's destroyed on the way, the passengers bail out hurt and shaken, and the wreck becomes the obstacle.
@@ -100,7 +100,7 @@ src/
   faction.rs         Humans / Termbots, local player
   map/
     mod.rs           Tiles, terrain rules (can_step, move cost), sectors
-    generate.rs      Procedural mirrored map generation + validation
+    generate.rs      Procedural random map generation + balance validation
     noise.rs         Seeded value noise
     render.rs        Placeholder map texture, sector borders and labels
   sim/
