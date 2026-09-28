@@ -135,7 +135,7 @@ fn engineer_builds_a_turret_when_signalled() {
     push(&mut app, SimCommand::Build { issuer: H, platoon: id, kind: GadgetKind::Turret, target: TilePos::new(43, 33) });
     run(&mut app, 2);
     assert_eq!(app.world().resource::<Supply>().0[0], before - 150.0 + 3.0 * 2.0 * DT, "paid when sent");
-    run(&mut app, 20 * 16);
+    run(&mut app, 20 * 28);
     let world = app.world_mut();
     let turrets: Vec<(Faction, TilePos)> =
         world.query::<(&Faction, &TilePos, &Gadget)>().iter(world).map(|(f, p, _)| (*f, *p)).collect();
@@ -392,7 +392,7 @@ fn turret_build_ticks(n: usize) -> u32 {
     let platoon = app.world().get::<super::fighter::Fighter>(members[0]).unwrap().platoon;
     let id = app.world().get::<Platoon>(platoon).unwrap().id;
     push(&mut app, SimCommand::Build { issuer: H, platoon: id, kind: GadgetKind::Turret, target: TilePos::new(41, 33) });
-    for t in 1..=20 * 30 {
+    for t in 1..=20 * 40 {
         run(&mut app, 1);
         let world = app.world_mut();
         if world.query::<&Gadget>().iter(world).count() > 0 {
@@ -406,7 +406,7 @@ fn turret_build_ticks(n: usize) -> u32 {
 fn more_engineers_build_faster() {
     let one = turret_build_ticks(1);
     let three = turret_build_ticks(3);
-    // Turret: 8 s of work, Toolkit x1.6 -> 5 s alone, about 1.7 s for three
+    // Turret: 20 s of work, Toolkit x1.6 -> 12.5 s alone, about 4.2 s for three
     // (plus walking to the site either way).
     assert!(three + 40 < one, "1 engineer: {one} ticks, 3 engineers: {three} ticks");
     eprintln!("turret build: 1 engineer {one} ticks, 3 engineers {three} ticks");
