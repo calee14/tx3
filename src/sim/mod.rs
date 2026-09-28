@@ -11,6 +11,7 @@
 //! - Rendering reads sim state but never writes it.
 
 pub mod ai;
+pub mod armory;
 pub mod classes;
 pub mod combat;
 pub mod economy;
@@ -219,11 +220,9 @@ pub enum SimCommand {
     /// Battle: signal a platoon's engineer to build a gadget at an explored
     /// tile. Paid when sent; refunded if the build is abandoned.
     Build { issuer: Faction, platoon: PlatoonId, kind: gadgets::GadgetKind, target: TilePos },
-    /// Battle: call an air strike on an explored tile (costly, long
-    /// cooldown, 4 s warning).
+    /// Battle: call an air strike on an explored tile (if brought; costly,
+    /// long cooldown, a few seconds' warning).
     AirStrike { issuer: Faction, target: TilePos },
-    /// Battle: order an artillery piece to shell a tile next.
-    ArtilleryFire { issuer: Faction, unit: UnitId, target: TilePos },
 }
 
 /// Commands waiting for the next tick. Commands issued while the game is

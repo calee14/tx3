@@ -23,6 +23,7 @@ use std::collections::HashSet;
 use bevy::prelude::*;
 use rand::Rng;
 
+use super::armory::{Armories, Machine};
 use super::classes::{ArmorClass, DamageType, Equipment, FighterClass, Loadout, Traits, damage_multiplier};
 use super::combat::{ShotLog, ShotRecord};
 use super::economy::Supply;
@@ -62,16 +63,85 @@ pub const TURRET_INTERVAL: f32 = 0.6;
 pub const TURRET_ACCURACY: f32 = 0.6;
 pub const TURRET_SUPPRESSION: f32 = 6.0;
 
+/// How a turret shoots, by variant (machine gun, or cannon).
+#[derive(Clone, Copy, Debug)]
+pub struct TurretProfile {
+    pub range: f32,
+    pub damage: f32,
+    pub interval: f32,
+    pub accuracy: f32,
+    pub damage_type: DamageType,
+    pub suppression: f32,
+}
+
+pub fn turret_profile(alt: bool) -> TurretProfile {
+    if alt {
+        TurretProfile {
+            range: 13.0,
+            damage: 40.0,
+            interval: 2.0,
+            accuracy: 0.5,
+            damage_type: DamageType::Explosive,
+            suppression: 15.0,
+        }
+    } else {
+        TurretProfile {
+            range: TURRET_RANGE,
+            damage: TURRET_DAMAGE,
+            interval: TURRET_INTERVAL,
+            accuracy: TURRET_ACCURACY,
+            damage_type: DamageType::Standard,
+            suppression: TURRET_SUPPRESSION,
+        }
+    }
+}
+
+/// Blast of a mine or bomb, by variant: (radius, damage).
+pub fn trap_blast(kind: GadgetKind, alt: bool) -> (f32, f32) {
+    match (kind, alt) {
+        (GadgetKind::Mine, false) => (MINE_RADIUS, MINE_DAMAGE),
+        (GadgetKind::Mine, true) => (2.5, 55.0),
+        (GadgetKind::Bomb, false) => (BOMB_RADIUS, BOMB_DAMAGE),
+        (GadgetKind::Bomb, true) => (4.0, 110.0),
+        _ => (0.0, 0.0),
+    }
+}
+
 // --- Artillery ---
+// Artillery is support fire the King doesn't aim: it shells enemies its
+// side can see near its own troops, from long range, slowly, and not very
+// accurately. A shell can land square on target, graze it, or miss.
 pub const ARTILLERY_DELAY: u64 = secs(3.0);
 pub const ARTILLERY_RADIUS: f32 = 2.5;
 pub const ARTILLERY_DAMAGE: f32 = 65.0;
-pub const ARTILLERY_COOLDOWN: f32 = 15.0;
-pub const ARTILLERY_RANGE: f32 = 50.0;
-pub const ARTILLERY_JITTER: f32 = 1.2;
+pub const ARTILLERY_COOLDOWN: f32 = 25.0;
+pub const ARTILLERY_RANGE: f32 = 60.0;
+/// Shells land anywhere within this many tiles of the aim point.
+pub const ARTILLERY_SCATTER: f32 = 3.0;
+/// It only shells enemies within this distance of one of its side's units.
+pub const ARTILLERY_SUPPORT_RANGE: f32 = 12.0;
+/// It never aims this close to its own units (a stray shell still can).
+pub const ARTILLERY_SAFETY: f32 = 2.5;
+
+/// (radius, damage, cooldown, scatter) by variant (field gun, howitzer).
+pub fn artillery_profile(alt: bool) -> (f32, f32, f32, f32) {
+    if alt {
+        (3.5, 85.0, 40.0, 4.0)
+    } else {
+        (ARTILLERY_RADIUS, ARTILLERY_DAMAGE, ARTILLERY_COOLDOWN, ARTILLERY_SCATTER)
+    }
+}
 
 // --- Air strike ---
 pub const AIR_STRIKE_COST: f32 = 250.0;
+pub const PRECISION_STRIKE_COST: f32 = 200.0;
+pub const PRECISION_STRIKE_DELAY: u64 = secs(3.0);
+pub const PRECISION_STRIKE_RADIUS: f32 = 2.2;
+pub const PRECISION_STRIKE_DAMAGE: f32 = 110.0;
+
+pub fn air_strike_cost(alt: bool) -> f32 {
+    if alt { PRECISION_STRIKE_COST } else { AIR_STRIKE_COST }
+}
 pub const AIR_STRIKE_COOLDOWN: u64 = secs(90.0);
 pub const AIR_STRIKE_DELAY: u64 = secs(4.0);
 pub const AIR_STRIKE_IMPACTS: i32 = 5;
@@ -200,8 +270,9 @@ pub struct Gadget {
     pub cooldown: f32,
     /// A bomb's countdown once triggered.
     pub fuse: Option<f32>,
-    /// Artillery: where the King ordered the next shell.
-    pub aim: Option<TilePos>,
+    /// The second variant from the armory (shrapnel mine, heavy bomb,
+    /// cannon turret, howitzer).
+    pub alt: bool,
     pub last_shot_tick: Option<u64>,
 }
 
@@ -294,6 +365,7 @@ pub fn spawn_gadget(
     faction: Faction,
     kind: GadgetKind,
     at: TilePos,
+    alt: bool,
 ) -> Entity {
     let id = index.allocate();
     let stats = kind.stats();
@@ -308,11 +380,12 @@ pub fn spawn_gadget(
         SimInterp::at(at.to_world()),
         Transform::from_translation(at.to_world().extend(0.0)),
         Health::new(stats.health),
-        Gadget { kind, cooldown: 0.0, fuse: None, aim: None, last_shot_tick: None },
+        Gadget { kind, cooldown: 0.0, fuse: None, alt, last_shot_tick: None },
         Concealed { revealed_to },
     ));
-    if stats.vision > 0.0 {
-        e.insert((Vision { radius: stats.vision }, Perception::default()));
+    let vision = if kind == GadgetKind::Turret { turret_profile(alt).range } else { stats.vision };
+    if vision > 0.0 {
+        e.insert((Vision { radius: vision }, Perception::default()));
     }
     let entity = e.id();
     index.entities.insert(id, entity);
@@ -321,7 +394,11 @@ pub fn spawn_gadget(
 
 /// Impact points of an air strike: a line of bombs through `target`, along
 /// the direction the King is looking (from the King toward the target).
-pub fn air_strike_impacts(from: TilePos, target: TilePos, tick: u64) -> Vec<(TilePos, u64)> {
+/// A precision strike is a single bomb on the target.
+pub fn air_strike_impacts(from: TilePos, target: TilePos, tick: u64, alt: bool) -> Vec<(TilePos, u64)> {
+    if alt {
+        return vec![(target, tick + PRECISION_STRIKE_DELAY)];
+    }
     let dir = Vec2::new((target.x - from.x) as f32, (target.y - from.y) as f32).normalize_or(Vec2::Y);
     (0..AIR_STRIKE_IMPACTS)
         .map(|k| {
@@ -333,13 +410,13 @@ pub fn air_strike_impacts(from: TilePos, target: TilePos, tick: u64) -> Vec<(Til
         .collect()
 }
 
-pub fn air_strike(faction: Faction, from: TilePos, target: TilePos, tick: u64) -> Strike {
+pub fn air_strike(faction: Faction, from: TilePos, target: TilePos, tick: u64, alt: bool) -> Strike {
     Strike {
         faction,
         kind: StrikeKind::Air,
-        impacts: air_strike_impacts(from, target, tick),
-        radius: AIR_STRIKE_RADIUS,
-        damage: AIR_STRIKE_DAMAGE,
+        impacts: air_strike_impacts(from, target, tick, alt),
+        radius: if alt { PRECISION_STRIKE_RADIUS } else { AIR_STRIKE_RADIUS },
+        damage: if alt { PRECISION_STRIKE_DAMAGE } else { AIR_STRIKE_DAMAGE },
         breach: false,
         source: None,
         launched_tick: tick,
@@ -438,7 +515,7 @@ pub fn trigger_traps(
         let explode = match gadget.kind {
             GadgetKind::Mine => {
                 let stepped = walkers.iter().any(|(_, f, p)| *f == enemy && *p == *pos);
-                stepped.then_some((MINE_RADIUS, MINE_DAMAGE))
+                stepped.then_some(trap_blast(GadgetKind::Mine, gadget.alt))
             }
             GadgetKind::Bomb => {
                 if gadget.fuse.is_none() {
@@ -450,7 +527,7 @@ pub fn trigger_traps(
                 match gadget.fuse.as_mut() {
                     Some(fuse) => {
                         *fuse -= DT;
-                        (*fuse <= 0.0).then_some((BOMB_RADIUS, BOMB_DAMAGE))
+                        (*fuse <= 0.0).then_some(trap_blast(GadgetKind::Bomb, gadget.alt))
                     }
                     None => None,
                 }
@@ -499,12 +576,13 @@ pub fn fire_turrets(
         if gadget.cooldown > 0.0 {
             continue;
         }
+        let gun = turret_profile(gadget.alt);
         let mut best: Option<(f32, UnitId, Entity, TilePos, bool, ArmorClass, f32)> = None;
         for &t in &perception.seen_enemies {
             let Ok((u, _, p, m, _, _, _)) = targets.get(t) else { continue };
             let (id, tpos, moving, class) = (u.id, *p, !m.path.is_empty(), u.class);
             let d = pos.distance(tpos);
-            if d > TURRET_RANGE {
+            if d > gun.range {
                 continue;
             }
             let (armor, armor_class) = unit_armor(class);
@@ -513,7 +591,7 @@ pub fn fire_turrets(
             }
         }
         let Some((d, _, target, tpos, moving, armor_class, armor)) = best else { continue };
-        let mut p = TURRET_ACCURACY * (1.0 - 0.5 * (d / TURRET_RANGE).powi(2));
+        let mut p = gun.accuracy * (1.0 - 0.5 * (d / gun.range).powi(2));
         p *= match map.cover_against(tpos, *pos) {
             CoverLevel::None => 1.0,
             CoverLevel::Light => 0.7,
@@ -524,15 +602,15 @@ pub fn fire_turrets(
         }
         let hit = rng.0.random::<f32>() < p;
         let damage = if hit {
-            TURRET_DAMAGE
+            gun.damage
                 * rng.0.random_range(0.8..1.2)
-                * damage_multiplier(DamageType::Standard, armor_class)
+                * damage_multiplier(gun.damage_type, armor_class)
                 * (1.0 - armor)
         } else {
             0.0
         };
-        effects.push((target, damage, TURRET_SUPPRESSION * if hit { 1.5 } else { 1.0 }));
-        gadget.cooldown = TURRET_INTERVAL * rng.0.random_range(0.9..1.1);
+        effects.push((target, damage, gun.suppression * if hit { 1.5 } else { 1.0 }));
+        gadget.cooldown = gun.interval * rng.0.random_range(0.9..1.1);
         gadget.last_shot_tick = Some(tick.0);
         log.0.push(ShotRecord { from: *pos, to: tpos, hit, shooter: UnitClass::Gadget(GadgetKind::Turret) });
         // Muzzle flashes give it away to whoever it shoots at.
@@ -554,8 +632,10 @@ pub fn fire_turrets(
 
 type ArtilleryQuery<'a> = (Entity, &'a Unit, &'a Faction, &'a TilePos, &'a mut Gadget, &'a mut Concealed);
 
-/// Artillery fires when ready: at the King's chosen spot, or at the
-/// biggest group of enemies its side can see (never near its own units).
+/// Artillery fires on its own whenever it's ready: at enemies its side can
+/// see that are near its own troops (support fire), preferring the biggest
+/// group, never aiming right on top of its own units. Shells scatter, so
+/// they can hit, graze or miss. The King can't aim it.
 pub fn fire_artillery(
     tick: Res<SimTick>,
     mut rng: ResMut<SimRng>,
@@ -573,39 +653,39 @@ pub fn fire_artillery(
         if gun.cooldown > 0.0 {
             continue;
         }
-        let target = match gun.aim.take() {
-            Some(t) if t.distance(*pos) <= ARTILLERY_RANGE => Some(t),
-            _ => {
-                // Everything this side sees right now.
-                let seen: HashSet<Entity> = viewers
-                    .iter()
-                    .filter(|(f, _)| *f == faction)
-                    .flat_map(|(_, p)| p.seen_enemies.iter().copied())
-                    .collect();
-                let enemies: Vec<(UnitId, TilePos)> = seen
-                    .iter()
-                    .filter_map(|e| units.get(*e).ok())
-                    .filter(|(_, f, _)| **f != *faction)
-                    .map(|(u, _, p)| (u.id, *p))
-                    .collect();
-                let friends: Vec<TilePos> = units.iter().filter(|(_, f, _)| *f == faction).map(|(_, _, p)| *p).collect();
-                enemies
-                    .iter()
-                    .filter(|(_, p)| p.distance(*pos) <= ARTILLERY_RANGE)
-                    .filter(|(_, p)| friends.iter().all(|f| f.distance(*p) > ARTILLERY_RADIUS + 1.0))
-                    .map(|(id, p)| (enemies.iter().filter(|(_, q)| q.distance(*p) <= ARTILLERY_RADIUS).count(), *id, *p))
-                    .filter(|(n, _, _)| *n >= 2)
-                    .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
-                    .map(|(_, _, p)| p)
-            }
-        };
+        let (radius, damage, cooldown, scatter) = artillery_profile(gun.alt);
+        // Everything this side sees right now.
+        let seen: HashSet<Entity> = viewers
+            .iter()
+            .filter(|(f, _)| *f == faction)
+            .flat_map(|(_, p)| p.seen_enemies.iter().copied())
+            .collect();
+        let mut enemies: Vec<(UnitId, TilePos)> = seen
+            .iter()
+            .filter_map(|e| units.get(*e).ok())
+            .filter(|(_, f, _)| **f != *faction)
+            .map(|(u, _, p)| (u.id, *p))
+            .collect();
+        enemies.sort();
+        let friends: Vec<TilePos> = units.iter().filter(|(_, f, _)| *f == faction).map(|(_, _, p)| *p).collect();
+        let target = enemies
+            .iter()
+            .filter(|(_, p)| p.distance(*pos) <= ARTILLERY_RANGE)
+            .filter(|(_, p)| {
+                let nearest = friends.iter().map(|f| f.distance(*p)).fold(f32::MAX, f32::min);
+                nearest <= ARTILLERY_SUPPORT_RANGE && nearest > ARTILLERY_SAFETY
+            })
+            .map(|(id, p)| (enemies.iter().filter(|(_, q)| q.distance(*p) <= radius).count(), *id, *p))
+            .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
+            .map(|(_, _, p)| p);
         let Some(target) = target else {
             gun.cooldown = 1.0; // look again in a second
             continue;
         };
-        let jx = rng.0.random_range(-ARTILLERY_JITTER..=ARTILLERY_JITTER).round() as i32;
-        let jy = rng.0.random_range(-ARTILLERY_JITTER..=ARTILLERY_JITTER).round() as i32;
-        let at = target.offset(jx, jy);
+        // Scatter: anywhere in a disk around the aim point.
+        let angle = rng.0.random_range(0.0..std::f32::consts::TAU);
+        let dist = scatter * rng.0.random::<f32>().sqrt();
+        let at = target.offset((angle.cos() * dist).round() as i32, (angle.sin() * dist).round() as i32);
         let at = if at.in_bounds() { at } else { target };
         commands.spawn((
             MatchEntity,
@@ -613,14 +693,14 @@ pub fn fire_artillery(
                 faction: *faction,
                 kind: StrikeKind::Artillery,
                 impacts: vec![(at, tick.0 + ARTILLERY_DELAY)],
-                radius: ARTILLERY_RADIUS,
-                damage: ARTILLERY_DAMAGE,
+                radius,
+                damage,
                 breach: false,
                 source: None,
                 launched_tick: tick.0,
             },
         ));
-        gun.cooldown = ARTILLERY_COOLDOWN;
+        gun.cooldown = cooldown;
         gun.last_shot_tick = Some(tick.0);
         // The boom gives its position away.
         concealed.revealed_to[faction.opponent().index()] = true;
@@ -938,6 +1018,7 @@ pub fn update_engineers(
     mut index: ResMut<UnitIndex>,
     mut supply: ResMut<Supply>,
     known: Res<KnownTraps>,
+    armories: Res<Armories>,
     gadgets: Query<(Entity, &Unit, &Faction, &TilePos, &Gadget)>,
     viewers: Query<(&Faction, &Perception)>,
     platoons: Query<&Platoon>,
@@ -1021,7 +1102,8 @@ pub fn update_engineers(
                         continue;
                     }
                     if work.progress >= 1.0 {
-                        spawn_gadget(&mut commands, &mut index, *faction, kind, work.tile);
+                        let alt = armories.of(*faction).gadget_variant(kind).unwrap_or(false);
+                        spawn_gadget(&mut commands, &mut index, *faction, kind, work.tile, alt);
                         cond.work = None;
                         if matches!(eq.loadout, Loadout::Toolkit | Loadout::MineLayer) && seen_by_enemy {
                             reveal(&mut eq, *faction);
@@ -1162,10 +1244,8 @@ pub fn escape_tile(
 }
 
 
-type GunQuery<'a> = (&'a Faction, &'a TilePos, &'a mut Gadget);
-
-/// Battle commands for gadgets: engineer build orders (sent as signals),
-/// air strikes and artillery targets.
+/// Battle commands for gadgets: engineer build orders (sent as signals)
+/// and air strikes. Only for what the side brought in its armory.
 #[allow(clippy::too_many_arguments)]
 pub fn process_gadget_commands(
     mut commands: Commands,
@@ -1177,10 +1257,11 @@ pub fn process_gadget_commands(
     mut supply: ResMut<Supply>,
     mut air: ResMut<AirSupport>,
     mut flight: ResMut<super::platoon::SignalsInFlight>,
+    armories: Res<Armories>,
     platoons: Query<(&Faction, &Platoon)>,
     fighters: Query<&Fighter>,
     kings: Query<(&Unit, &Faction, &TilePos), Without<Gadget>>,
-    mut guns: Query<GunQuery>,
+    sites: Query<&TilePos, With<Gadget>>,
 ) {
     use super::SimCommand;
     let explored = |f: Faction, t: TilePos| t.in_bounds() && fog.as_ref().is_none_or(|fog| fog.is_explored(f, t));
@@ -1188,7 +1269,7 @@ pub fn process_gadget_commands(
         kings.iter().find(|(u, uf, _)| u.class == UnitClass::King && **uf == f).map(|(_, _, p)| *p)
     };
     let cmds = queue.take_matching(|c| {
-        matches!(c, SimCommand::Build { .. } | SimCommand::AirStrike { .. } | SimCommand::ArtilleryFire { .. })
+        matches!(c, SimCommand::Build { .. } | SimCommand::AirStrike { .. })
     });
     for command in cmds {
         match command {
@@ -1197,7 +1278,7 @@ pub fn process_gadget_commands(
                 let Ok((faction, p)) = platoons.get(entity) else { continue };
                 let has_engineer =
                     p.members.iter().any(|m| fighters.get(*m).is_ok_and(|f| f.class == FighterClass::Engineer));
-                let occupied = guns.iter().any(|(_, gp, _)| *gp == target);
+                let occupied = sites.iter().any(|gp| *gp == target);
                 if *faction != issuer
                     || !has_engineer
                     || !explored(issuer, target)
@@ -1207,7 +1288,10 @@ pub fn process_gadget_commands(
                     debug!("{issuer:?} build order rejected");
                     continue;
                 }
-                let cost = kind.stats().cost;
+                let Some(cost) = armories.of(issuer).gadget_price(kind) else {
+                    debug!("{issuer:?} didn't bring {kind:?}");
+                    continue;
+                };
                 if supply.0[issuer.index()] < cost {
                     continue;
                 }
@@ -1225,25 +1309,15 @@ pub fn process_gadget_commands(
             }
             SimCommand::AirStrike { issuer, target } => {
                 let i = issuer.index();
-                if !explored(issuer, target) || !air.ready(issuer, tick.0) || supply.0[i] < AIR_STRIKE_COST {
+                let Some(alt) = armories.of(issuer).variant(Machine::AirStrike) else { continue };
+                let cost = air_strike_cost(alt);
+                if !explored(issuer, target) || !air.ready(issuer, tick.0) || supply.0[i] < cost {
                     continue;
                 }
-                supply.0[i] -= AIR_STRIKE_COST;
+                supply.0[i] -= cost;
                 air.ready_tick[i] = tick.0 + AIR_STRIKE_COOLDOWN;
                 let from = king_pos(issuer).unwrap_or(target);
-                commands.spawn((MatchEntity, air_strike(issuer, from, target, tick.0)));
-            }
-            SimCommand::ArtilleryFire { issuer, unit, target } => {
-                let Some(&entity) = index.entities.get(&unit) else { continue };
-                let Ok((faction, pos, mut gun)) = guns.get_mut(entity) else { continue };
-                if *faction != issuer
-                    || gun.kind != GadgetKind::Artillery
-                    || !explored(issuer, target)
-                    || pos.distance(target) > ARTILLERY_RANGE
-                {
-                    continue;
-                }
-                gun.aim = Some(target);
+                commands.spawn((MatchEntity, air_strike(issuer, from, target, tick.0, alt)));
             }
             _ => {}
         }

@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use bevy::ecs::world::CommandQueue as EcsQueue;
 use bevy::prelude::*;
 
+use super::armory::{Armories, Armory};
 use super::classes::{Equipment, FighterClass, Loadout};
 use super::combat::ShotLog;
 use super::economy::{MatchPhase, SetupLog, Supply};
@@ -27,7 +28,7 @@ fn sandbox() -> App {
     let mut map = {
         let mut queue = EcsQueue::default();
         let mut commands = Commands::new(&mut queue, world);
-        let map = crate::game::setup_simulation(&mut commands, 42);
+        let map = crate::game::setup_simulation(&mut commands, 42, Armories([Armory::everything(), Armory::everything()]));
         queue.apply(world);
         map
     };
@@ -49,7 +50,8 @@ fn run(app: &mut App, ticks: u32) {
 
 fn squad(app: &mut App, faction: Faction, classes: &[FighterClass], anchor: TilePos, mission: Mission) -> Vec<Entity> {
     let world = app.world_mut();
-    let recruits = roll_recruits(classes, &mut world.resource_mut::<SimRng>().0);
+    let armory = world.resource::<Armories>().of(faction).clone();
+    let recruits = roll_recruits(classes, &armory, &mut world.resource_mut::<SimRng>().0);
     let map = world.resource::<GameMap>().clone();
     let mut queue = EcsQueue::default();
     let members = world.resource_scope(|world, mut index: Mut<UnitIndex>| {
@@ -66,7 +68,7 @@ fn gadget(app: &mut App, faction: Faction, kind: GadgetKind, at: TilePos) -> Ent
     let mut queue = EcsQueue::default();
     let e = world.resource_scope(|world, mut index: Mut<UnitIndex>| {
         let mut commands = Commands::new(&mut queue, world);
-        spawn_gadget(&mut commands, &mut index, faction, kind, at)
+        spawn_gadget(&mut commands, &mut index, faction, kind, at, false)
     });
     queue.apply(world);
     e
@@ -270,8 +272,8 @@ fn loadouts_stay_secret_until_used() {
     let mut app = sandbox();
     let gunner = squad(&mut app, H, &[FighterClass::HeavyWeapons], TilePos::new(60, 50), Mission::Overwatch)[0];
     let rifle = squad(&mut app, H, &[FighterClass::Assaulter], TilePos::new(64, 50), Mission::Overwatch)[0];
-    *app.world_mut().get_mut::<Equipment>(gunner).unwrap() = Equipment::new(Loadout::MachineGun, 0);
-    *app.world_mut().get_mut::<Equipment>(rifle).unwrap() = Equipment::new(Loadout::Rifle, 0);
+    *app.world_mut().get_mut::<Equipment>(gunner).unwrap() = Equipment::new(Loadout::MachineGun, super::armory::Modifier::None, 0);
+    *app.world_mut().get_mut::<Equipment>(rifle).unwrap() = Equipment::new(Loadout::Rifle, super::armory::Modifier::None, 0);
     assert!(!app.world().get::<Equipment>(gunner).unwrap().known_to[1]);
     squad(&mut app, T, &[FighterClass::Assaulter], TilePos::new(60, 58), Mission::Overwatch);
     run(&mut app, 60);
@@ -283,7 +285,7 @@ fn loadouts_stay_secret_until_used() {
 fn smoke_kit_pops_smoke_when_pinned() {
     let mut app = sandbox();
     let sniper = squad(&mut app, H, &[FighterClass::Sniper], TilePos::new(60, 50), Mission::Overwatch)[0];
-    *app.world_mut().get_mut::<Equipment>(sniper).unwrap() = Equipment::new(Loadout::SmokeKit, 0);
+    *app.world_mut().get_mut::<Equipment>(sniper).unwrap() = Equipment::new(Loadout::SmokeKit, super::armory::Modifier::None, 0);
     app.world_mut().get_mut::<Condition>(sniper).unwrap().suppression = 90.0;
     run(&mut app, 2);
     let map = app.world().resource::<GameMap>();
@@ -338,7 +340,7 @@ fn ability_duel(
         app.world_mut().resource_mut::<GameMap>().tile_mut(p).feature = f;
     }
     let me = squad(&mut app, H, &[class], TilePos::new(60, 50), Mission::Overwatch)[0];
-    *app.world_mut().get_mut::<Equipment>(me).unwrap() = Equipment::new(loadout, 0);
+    *app.world_mut().get_mut::<Equipment>(me).unwrap() = Equipment::new(loadout, super::armory::Modifier::None, 0);
     squad(&mut app, T, &[target], at, Mission::Overwatch);
     run(&mut app, secs * 20);
     let blasts = app.world().resource::<BlastLog>().0.len();
@@ -387,7 +389,7 @@ fn turret_build_ticks(n: usize) -> u32 {
     let mut app = sandbox();
     let members = squad(&mut app, H, &vec![FighterClass::Engineer; n], TilePos::new(40, 30), Mission::Overwatch);
     for m in &members {
-        *app.world_mut().get_mut::<Equipment>(*m).unwrap() = Equipment::new(Loadout::Toolkit, 0);
+        *app.world_mut().get_mut::<Equipment>(*m).unwrap() = Equipment::new(Loadout::Toolkit, super::armory::Modifier::None, 0);
     }
     let platoon = app.world().get::<super::fighter::Fighter>(members[0]).unwrap().platoon;
     let id = app.world().get::<Platoon>(platoon).unwrap().id;
@@ -411,4 +413,63 @@ fn more_engineers_build_faster() {
     assert!(three + 40 < one, "1 engineer: {one} ticks, 3 engineers: {three} ticks");
     eprintln!("turret build: 1 engineer {one} ticks, 3 engineers {three} ticks");
     assert!(one >= 100, "a lone engineer takes at least 5 s: {one}");
+}
+
+#[test]
+fn only_brought_machines_can_be_used() {
+    let mut app = sandbox();
+    // Humans bring the default armory: mines, turrets, air strikes.
+    app.world_mut().resource_mut::<Armories>().0[0] = Armory::default();
+    app.world_mut().resource_mut::<MatchPhase>().battle = false;
+    push(&mut app, SimCommand::PlaceGadget { issuer: H, kind: GadgetKind::Bomb, at: TilePos::new(60, 30) });
+    push(&mut app, SimCommand::PlaceGadget { issuer: H, kind: GadgetKind::Mine, at: TilePos::new(62, 30) });
+    run(&mut app, 1);
+    let world = app.world_mut();
+    let kinds: Vec<GadgetKind> = world.query::<&Gadget>().iter(world).map(|g| g.kind).collect();
+    assert_eq!(kinds, vec![GadgetKind::Mine], "bombs weren't brought");
+}
+
+#[test]
+fn fighters_come_with_their_class_kit() {
+    use super::armory::{Kit, Modifier};
+    let mut app = sandbox();
+    *app.world_mut().resource_mut::<Armories>().0[0].kit_mut(FighterClass::Assaulter) =
+        Kit { loadout: Loadout::Grenades, modifier: Modifier::BodyArmor };
+    let a = squad(&mut app, H, &[FighterClass::Assaulter], TilePos::new(40, 30), Mission::Overwatch)[0];
+    let eq = *app.world().get::<Equipment>(a).unwrap();
+    assert_eq!(eq.loadout, Loadout::Grenades);
+    assert_eq!(eq.modifier, Modifier::BodyArmor);
+    let h = app.world().get::<Health>(a).unwrap();
+    assert_eq!(h.max, FighterClass::Assaulter.stats().max_health * 1.25);
+}
+
+#[test]
+fn artillery_only_supports_its_own_troops() {
+    let mut app = sandbox();
+    gadget(&mut app, H, GadgetKind::Artillery, TilePos::new(60, 20));
+    // The turret sees the enemy, but no Humans troops are near them.
+    gadget(&mut app, H, GadgetKind::Turret, TilePos::new(60, 61));
+    squad(&mut app, T, &[FighterClass::Assaulter; 2], TilePos::new(60, 71), Mission::Overwatch);
+    let fired = |app: &mut App| {
+        let world = app.world_mut();
+        world.query::<&Strike>().iter(world).count() > 0
+    };
+    run(&mut app, 40);
+    let seen = {
+        let world = app.world_mut();
+        world.query::<(&Faction, &super::perception::Perception)>().iter(world).any(|(f, p)| *f == H && !p.seen_enemies.is_empty())
+    };
+    assert!(seen, "the turret has them in sight");
+    assert!(!fired(&mut app), "no friendly troops near the enemy: holds fire");
+    // Friendly troops move up within support range.
+    squad(&mut app, H, &[FighterClass::Sniper], TilePos::new(62, 63), Mission::Overwatch);
+    let mut shot = false;
+    for _ in 0..60 {
+        run(&mut app, 1);
+        if fired(&mut app) {
+            shot = true;
+            break;
+        }
+    }
+    assert!(shot, "fires in support once its troops are near");
 }

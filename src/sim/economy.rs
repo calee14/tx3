@@ -19,6 +19,7 @@ use std::collections::HashSet;
 
 use bevy::prelude::*;
 
+use super::armory::{Armories, Armory};
 use super::classes::FighterClass;
 use super::combat::MatchOutcome;
 use super::fighter::Fighter;
@@ -55,13 +56,7 @@ pub fn base_cost(class: FighterClass) -> f32 {
 }
 
 fn class_index(class: FighterClass) -> usize {
-    match class {
-        FighterClass::Assaulter => 0,
-        FighterClass::Sniper => 1,
-        FighterClass::HeavyWeapons => 2,
-        FighterClass::Juggernaut => 3,
-        FighterClass::Engineer => 4,
-    }
+    class.index()
 }
 
 /// How many fighters of each class a side currently has.
@@ -83,15 +78,37 @@ pub fn fighter_cost(class: FighterClass, counts: &ClassCounts) -> f32 {
 }
 
 /// Total price of a new platoon (each fighter raises the price of the next
-/// one of its class), plus the vehicle if it rides in.
-pub fn platoon_cost(classes: &[FighterClass], counts: &ClassCounts, vehicle: bool) -> f32 {
+/// one of its class), plus each fighter's kit from the armory, plus the
+/// vehicle if it rides in.
+pub fn platoon_cost(classes: &[FighterClass], counts: &ClassCounts, vehicle: bool, armory: &Armory) -> f32 {
     let mut counts = *counts;
     let mut total = 0.0;
     for &class in classes {
-        total += fighter_cost(class, &counts);
+        total += fighter_cost(class, &counts) + armory.surcharge(class);
         counts.add(class);
     }
     total + if vehicle { VEHICLE_COST } else { 0.0 }
+}
+
+/// Trim an army (list of platoons) until it fits `budget`: one fighter at
+/// a time from the biggest platoon, so no platoon is dropped outright.
+pub fn fit_army(mut army: Vec<Vec<FighterClass>>, budget: f32, armory: &Armory) -> Vec<Vec<FighterClass>> {
+    let cost = |army: &[Vec<FighterClass>]| {
+        let mut counts = ClassCounts::default();
+        let mut total = 0.0;
+        for p in army {
+            total += platoon_cost(p, &counts, false, armory);
+            for &c in p {
+                counts.add(c);
+            }
+        }
+        total
+    };
+    while cost(&army) > budget {
+        let Some(biggest) = army.iter_mut().filter(|p| p.len() > 1).max_by_key(|p| p.len()) else { break };
+        biggest.pop();
+    }
+    army
 }
 
 /// Count a side's fighters, including those riding in vehicles.
@@ -212,6 +229,7 @@ pub fn process_setup_commands(
     mut log: ResMut<SetupLog>,
     mut rng: ResMut<SimRng>,
     map: Res<GameMap>,
+    armories: Res<Armories>,
     positions: Query<&TilePos, With<Unit>>,
     fighters: Query<(&Faction, &Fighter)>,
     vehicles: Query<(&Faction, &Vehicle)>,
@@ -244,7 +262,8 @@ pub fn process_setup_commands(
                         counts.add(class);
                     }
                 }
-                let cost = platoon_cost(&classes, &counts, false);
+                let armory = armories.of(issuer);
+                let cost = platoon_cost(&classes, &counts, false, armory);
                 if cost > supply.0[i] {
                     continue;
                 }
@@ -252,7 +271,7 @@ pub fn process_setup_commands(
                 for &c in &classes {
                     placed_now[i].add(c);
                 }
-                let recruits = roll_recruits(&classes, &mut rng.0);
+                let recruits = roll_recruits(&classes, armory, &mut rng.0);
                 let (platoon, _) = spawn_platoon(
                     &mut commands,
                     &mut index,
@@ -281,13 +300,17 @@ pub fn process_setup_commands(
                 {
                     continue;
                 }
-                let cost = kind.stats().cost;
+                // Only what this side brought, in the variant it brought.
+                let armory = armories.of(issuer);
+                let (Some(alt), Some(cost)) = (armory.gadget_variant(kind), armory.gadget_price(kind)) else {
+                    continue;
+                };
                 if cost > supply.0[i] {
                     continue;
                 }
                 supply.0[i] -= cost;
                 taken.insert(at);
-                let gadget = spawn_gadget(&mut commands, &mut index, issuer, kind, at);
+                let gadget = spawn_gadget(&mut commands, &mut index, issuer, kind, at, alt);
                 log.0[i].push(SetupEntry::Gadget(gadget, cost));
             }
             SimCommand::UndoPlacement { issuer } => {
@@ -342,6 +365,7 @@ pub fn process_deployments(
     mut rng: ResMut<SimRng>,
     map: Res<GameMap>,
     fog: Res<FogOfWar>,
+    armories: Res<Armories>,
     positions: Query<&TilePos, With<Unit>>,
     fighters: Query<(&Faction, &Fighter)>,
     vehicles: Query<(&Faction, &Vehicle)>,
@@ -359,14 +383,15 @@ pub fn process_deployments(
             continue;
         }
         let counts = count_classes(issuer, fighters.iter(), vehicles.iter());
-        let cost = platoon_cost(&classes, &counts, vehicle);
+        let armory = armories.of(issuer);
+        let cost = platoon_cost(&classes, &counts, vehicle, armory);
         if cost > supply.0[i] {
             continue;
         }
         let entry = base_entry(&map, issuer);
         let Some(path) = find_path(&map, entry, target) else { continue };
         supply.0[i] -= cost;
-        let recruits = roll_recruits(&classes, &mut rng.0);
+        let recruits = roll_recruits(&classes, armory, &mut rng.0);
 
         if vehicle {
             spawn_vehicle(&mut commands, &mut index, issuer, entry, recruits, path, cost);
@@ -443,15 +468,15 @@ mod tests {
     #[test]
     fn prices_escalate_per_class() {
         let empty = ClassCounts::default();
-        assert_eq!(platoon_cost(&[FighterClass::Assaulter], &empty, false), 50.0);
+        assert_eq!(platoon_cost(&[FighterClass::Assaulter], &empty, false, &Armory::default()), 50.0);
         // 50 + 62.5 + 75
-        assert_eq!(platoon_cost(&[FighterClass::Assaulter; 3], &empty, false), 187.5);
+        assert_eq!(platoon_cost(&[FighterClass::Assaulter; 3], &empty, false, &Armory::default()), 187.5);
         // Other classes don't raise each other's price.
-        assert_eq!(platoon_cost(&[FighterClass::Assaulter, FighterClass::Sniper], &empty, false), 140.0);
+        assert_eq!(platoon_cost(&[FighterClass::Assaulter, FighterClass::Sniper], &empty, false, &Armory::default()), 140.0);
         let mut two_snipers = ClassCounts::default();
         two_snipers.add(FighterClass::Sniper);
         two_snipers.add(FighterClass::Sniper);
         assert_eq!(fighter_cost(FighterClass::Sniper, &two_snipers), 135.0);
-        assert_eq!(platoon_cost(&[FighterClass::Assaulter], &empty, true), 50.0 + VEHICLE_COST);
+        assert_eq!(platoon_cost(&[FighterClass::Assaulter], &empty, true, &Armory::default()), 50.0 + VEHICLE_COST);
     }
 }

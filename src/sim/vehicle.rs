@@ -128,7 +128,7 @@ pub fn update_vehicles(
         if vehicle.destroyed {
             // Bailed out of a burning wreck: hurt, suppressed and shaken.
             for (member, recruit) in members.iter().zip(&vehicle.cargo) {
-                let max = recruit.class.stats().max_health;
+                let max = recruit.max_health();
                 let mut condition = Condition::new(&recruit.traits);
                 condition.suppression = 60.0;
                 condition.morale = (condition.morale - 25.0).max(0.0);

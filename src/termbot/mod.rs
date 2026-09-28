@@ -42,7 +42,8 @@ use crate::sim::economy::{
     MatchPhase, Supply, Territory, base_entry, count_classes, in_battle, in_setup, platoon_cost, seconds_left,
 };
 use crate::sim::fighter::{Condition, Fighter};
-use crate::sim::gadgets::{AIR_STRIKE_COST, AirSupport, Concealed, GadgetKind, KnownTraps};
+use crate::sim::armory::{Armories, Armory, Machine};
+use crate::sim::gadgets::{AirSupport, Concealed, GadgetKind, KnownTraps, air_strike_cost};
 use crate::sim::perception::Perception;
 use crate::sim::platoon::{Mission, Platoon, PlatoonId};
 use crate::sim::vehicle::Vehicle;
@@ -191,6 +192,7 @@ impl Brain {
 
 fn ai_setup(
     mut ais: ResMut<AiCommanders>,
+    mut armories: ResMut<Armories>,
     phase: Res<MatchPhase>,
     map: Res<GameMap>,
     mut rng: ResMut<SimRng>,
@@ -201,13 +203,16 @@ fn ai_setup(
             continue;
         }
         brain.style = choose_style(&mut rng.0);
-        let plan = plan_setup(&map, brain.faction, brain.style, &mut rng.0);
+        // It picks what it brings before placing anything.
+        let armory = brain.style.armory(&mut rng.0);
+        armories.0[brain.faction.index()] = armory.clone();
+        let plan = plan_setup(&map, brain.faction, brain.style, &armory, &mut rng.0);
         for (classes, anchor) in &plan {
             queue.push(SimCommand::PlacePlatoon { issuer: brain.faction, classes: classes.clone(), anchor: *anchor });
             brain.setup_homes.push_back(*anchor);
         }
         let anchors: Vec<TilePos> = plan.iter().map(|(_, a)| *a).collect();
-        let gadgets = plan_gadgets(&map, brain.faction, brain.style, &anchors, &mut rng.0);
+        let gadgets = plan_gadgets(&map, brain.faction, brain.style, &armory, &anchors, &mut rng.0);
         for &(kind, at) in &gadgets {
             queue.push(SimCommand::PlaceGadget { issuer: brain.faction, kind, at });
         }
@@ -273,6 +278,7 @@ fn ai_battle(
     mut rng: ResMut<SimRng>,
     mut queue: ResMut<CommandQueue>,
     mut ais: ResMut<AiCommanders>,
+    armories: Res<Armories>,
     air: Res<AirSupport>,
     known_traps: Res<KnownTraps>,
     platoons: Query<(&Faction, &Platoon)>,
@@ -290,6 +296,7 @@ fn ai_battle(
             fog: &fog,
             territory: &territory,
             air_ready: air.ready(brain.faction, tick.0),
+            armory: armories.of(brain.faction),
             known_traps: known_traps.of(brain.faction).len(),
         };
         brain.next_think = tick.0 + THINK_INTERVAL;
@@ -305,6 +312,8 @@ struct World<'a> {
     territory: &'a Territory,
     /// Our air strike is off cooldown.
     air_ready: bool,
+    /// What we brought to this match.
+    armory: &'a Armory,
     /// Enemy traps our side has found.
     known_traps: usize,
 }
@@ -621,7 +630,11 @@ fn use_gadgets(
     let tick = w.tick;
     let me = brain.faction;
     let mut supply = supply;
-    if w.air_ready && supply >= AIR_STRIKE_COST + 60.0 {
+    let air = w.armory.variant(Machine::AirStrike);
+    if let Some(alt) = air
+        && w.air_ready
+        && supply >= air_strike_cost(alt) + 60.0
+    {
         let target = groups
             .iter()
             .filter(|g| g.members.len() >= 3 && g.behaviour != Behaviour::Rushing)
@@ -632,15 +645,24 @@ fn use_gadgets(
             .max_by(|a, b| a.strength.total_cmp(&b.strength));
         if let Some(g) = target {
             queue.push(SimCommand::AirStrike { issuer: me, target: g.center_tile() });
-            supply -= AIR_STRIKE_COST;
+            supply -= air_strike_cost(alt);
             brain.note(tick, format!("air strike on {} enemies {}", g.members.len(), g.behaviour.name()));
         }
     }
     if tick < brain.next_build {
         return;
     }
-    let kind = if own_structures < 2 { GadgetKind::Turret } else { GadgetKind::Bomb };
-    if supply < kind.stats().cost + 120.0 {
+    // Support weapons first, then traps; only what it brought.
+    use GadgetKind::*;
+    let wish: &[GadgetKind] = match own_structures {
+        0 => &[Artillery, Turret, Bomb, Mine],
+        1 => &[Turret, Artillery, Bomb, Mine],
+        _ => &[Bomb, Mine],
+    };
+    let Some((kind, price)) = wish.iter().find_map(|k| w.armory.gadget_price(*k).map(|p| (*k, p))) else {
+        return;
+    };
+    if supply < price + 120.0 {
         return;
     }
     let builder = ours.iter().find(|p| {
@@ -955,10 +977,10 @@ fn buy(
             classes.push(FighterClass::Assaulter);
         }
     }
-    while classes.len() > min_size && platoon_cost(&classes, counts, vehicle) + reserve > supply {
+    while classes.len() > min_size && platoon_cost(&classes, counts, vehicle, w.armory) + reserve > supply {
         classes.pop();
     }
-    let cost = platoon_cost(&classes, counts, vehicle);
+    let cost = platoon_cost(&classes, counts, vehicle, w.armory);
     if cost + reserve > supply {
         brain.next_buy = tick + THINK_INTERVAL;
         return 0.0;

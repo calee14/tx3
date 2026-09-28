@@ -12,6 +12,7 @@ use crate::map::generate::generate_map;
 use crate::map::render::spawn_map_visuals;
 use crate::sim::combat::MatchOutcome;
 use crate::sim::economy::{MatchPhase, SetupLog, Supply, Territory};
+use crate::sim::armory::{Armories, Armory};
 use crate::sim::platoon::spawn_king;
 use crate::sim::{CommandQueue, SimRng, SimTick, UnitIndex};
 
@@ -19,8 +20,7 @@ pub struct GamePlugin;
 
 impl Plugin for GamePlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, start_first_match)
-            .add_systems(Update, regenerate_on_key);
+        app.add_systems(Update, regenerate_on_key);
     }
 }
 
@@ -30,7 +30,7 @@ impl Plugin for GamePlugin {
 pub struct MatchEntity;
 
 /// Seed from the command line (`cargo run -- 12345`), or from the clock.
-fn initial_seed() -> u64 {
+pub fn initial_seed() -> u64 {
     std::env::args()
         .nth(1)
         .and_then(|arg| arg.parse().ok())
@@ -42,12 +42,12 @@ fn initial_seed() -> u64 {
         })
 }
 
-fn start_first_match(mut commands: Commands, mut images: ResMut<Assets<Image>>, local: Res<LocalPlayer>) {
-    start_match(&mut commands, &mut images, initial_seed(), local.0);
-}
-
-pub fn start_match(commands: &mut Commands, images: &mut Assets<Image>, seed: u64, local: Faction) {
-    let map = setup_simulation(commands, seed);
+/// Start a match: the local player brings `armory`; the AI commander picks
+/// its own during setup.
+pub fn start_match(commands: &mut Commands, images: &mut Assets<Image>, seed: u64, local: Faction, armory: &Armory) {
+    let mut armories = Armories::default();
+    armories.0[local.index()] = armory.clone();
+    let map = setup_simulation(commands, seed, armories);
     info!("Starting match on map seed {}", map.seed);
     spawn_map_visuals(commands, images, &map);
     spawn_fog_overlay(commands, images);
@@ -58,7 +58,7 @@ pub fn start_match(commands: &mut Commands, images: &mut Assets<Image>, seed: u6
 
 /// Everything the simulation needs for a match, with no rendering, so it
 /// can also run headless (tests, and later a dedicated server).
-pub fn setup_simulation(commands: &mut Commands, seed: u64) -> crate::map::GameMap {
+pub fn setup_simulation(commands: &mut Commands, seed: u64, armories: Armories) -> crate::map::GameMap {
     let map = generate_map(seed);
     // Separate stream from the map generator, but still derived from the seed.
     let rng = ChaCha8Rng::seed_from_u64(map.seed ^ 0x5EED_0F_BA77_1E);
@@ -67,6 +67,7 @@ pub fn setup_simulation(commands: &mut Commands, seed: u64) -> crate::map::GameM
         spawn_king(commands, &mut index, &map, faction);
     }
     // Armies are placed during the setup phase.
+    commands.insert_resource(armories);
     commands.insert_resource(MatchPhase::default());
     commands.insert_resource(Supply::default());
     commands.insert_resource(SetupLog::default());
@@ -83,23 +84,41 @@ pub fn setup_simulation(commands: &mut Commands, seed: u64) -> crate::map::GameM
     map
 }
 
-/// N: throw away the current match and generate a new map (next seed).
+/// N: throw away the current match and start another on a new map (next
+/// seed), with the same armory.
 fn regenerate_on_key(
     keys: Res<ButtonInput<KeyCode>>,
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
     map: Option<Res<crate::map::GameMap>>,
     local: Res<LocalPlayer>,
+    armories: Option<Res<Armories>>,
     entities: Query<Entity, With<MatchEntity>>,
 ) {
     if !keys.just_pressed(KeyCode::KeyN) {
         return;
     }
-    let next_seed = map.map(|m| m.seed + 1).unwrap_or_else(initial_seed);
+    let (Some(map), Some(armories)) = (map, armories) else { return };
+    let armory = armories.of(local.0).clone();
     for entity in &entities {
         commands.entity(entity).despawn();
     }
-    start_match(&mut commands, &mut images, next_seed, local.0);
+    start_match(&mut commands, &mut images, map.seed + 1, local.0, &armory);
+}
+
+/// Leave the current match (back to the menu): everything in it goes, and
+/// the match resources are removed so the game systems go idle.
+pub fn end_match(commands: &mut Commands, entities: impl Iterator<Item = Entity>) {
+    for entity in entities {
+        commands.entity(entity).despawn();
+    }
+    commands.remove_resource::<crate::map::GameMap>();
+    commands.remove_resource::<MatchPhase>();
+    commands.remove_resource::<CommandQueue>();
+    commands.remove_resource::<FogOfWar>();
+    commands.remove_resource::<MatchOutcome>();
+    commands.remove_resource::<Armories>();
+    commands.insert_resource(Selection::default());
 }
 
 #[cfg(test)]
@@ -118,13 +137,13 @@ mod tests {
         let map = {
             let mut queue = bevy::ecs::world::CommandQueue::default();
             let mut commands = Commands::new(&mut queue, world);
-            let map = setup_simulation(&mut commands, seed);
+            let map = setup_simulation(&mut commands, seed, Armories::default());
             queue.apply(world);
             map
         };
         world.insert_resource(map);
         let mut queue = world.resource_mut::<CommandQueue>();
-        for c in crate::commander::default_army_commands(Faction::Humans) {
+        for c in crate::commander::default_army_commands(Faction::Humans, &Armory::default(), 1000.0) {
             queue.push(c);
         }
         queue.push(crate::sim::SimCommand::Ready { issuer: Faction::Humans });
@@ -139,7 +158,7 @@ mod tests {
         let map = {
             let mut queue = bevy::ecs::world::CommandQueue::default();
             let mut commands = Commands::new(&mut queue, world);
-            let map = setup_simulation(&mut commands, seed);
+            let map = setup_simulation(&mut commands, seed, Armories::default());
             queue.apply(world);
             map
         };

@@ -6,6 +6,7 @@ use std::collections::{HashSet, VecDeque};
 use bevy::prelude::*;
 use rand::Rng;
 
+use super::armory::{Armory, Modifier};
 use super::classes::{Equipment, FighterClass, Loadout, Traits};
 use super::economy::Supply;
 use super::fighter::{Condition, Fighter, Health, Veterancy, Work, WorkKind};
@@ -434,17 +435,26 @@ pub fn spawn_king(commands: &mut Commands, index: &mut UnitIndex, map: &GameMap,
 pub struct Recruit {
     pub class: FighterClass,
     pub traits: Traits,
-    /// Hidden equipment, rolled at purchase.
+    /// Hidden equipment and upgrade, from the side's armory.
     pub loadout: Loadout,
+    pub modifier: Modifier,
 }
 
-pub fn roll_recruits(classes: &[FighterClass], rng: &mut impl Rng) -> Vec<Recruit> {
+impl Recruit {
+    pub fn max_health(&self) -> f32 {
+        self.class.stats().max_health * self.modifier.health_mult()
+    }
+}
+
+/// New fighters: traits rolled, kit from the armory.
+pub fn roll_recruits(classes: &[FighterClass], armory: &Armory, rng: &mut impl Rng) -> Vec<Recruit> {
     classes
         .iter()
-        .map(|&class| Recruit {
-            class,
-            traits: Traits::roll(&class.stats().traits, rng),
-            loadout: Loadout::roll(class, rng),
+        .map(|&class| {
+            let kit = armory.kit(class);
+            let mut traits = Traits::roll(&class.stats().traits, rng);
+            traits.accuracy = traits.accuracy.saturating_add(kit.modifier.accuracy_bonus()).min(100);
+            Recruit { class, traits, loadout: kit.loadout, modifier: kit.modifier }
         })
         .collect()
 }
@@ -490,16 +500,16 @@ pub fn spawn_platoon(
                 Unit { id, class: UnitClass::Fighter(recruit.class) },
                 faction,
                 pos,
-                Mover::new(stats.speed),
-                Vision { radius: stats.vision },
+                Mover::new(stats.speed * recruit.modifier.speed_mult()),
+                Vision { radius: stats.vision + recruit.modifier.vision_bonus() },
                 Perception::default(),
                 SimInterp::at(pos.to_world()),
                 Transform::from_translation(pos.to_world().extend(0.0)),
                 Fighter { class: recruit.class, platoon: platoon_entity, slot },
                 recruit.traits,
-                Health::new(stats.max_health),
+                Health::new(recruit.max_health()),
                 Condition::new(&recruit.traits),
-                Equipment::new(recruit.loadout, faction.index()),
+                Equipment::new(recruit.loadout, recruit.modifier, faction.index()),
                 Veterancy::default(),
             ))
             .id();

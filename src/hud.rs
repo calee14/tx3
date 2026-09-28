@@ -149,11 +149,11 @@ fn update_hud(
 
     lines.push(String::new());
     lines.push("Army panel (right): build a platoon or pick a gadget / air strike, then click the map".into());
-    lines.push("Left-click a fighter: select its platoon   (or your artillery, to aim it)".into());
+    lines.push("Left-click a fighter: select its platoon (or the King)".into());
     lines.push("1/2/3 or buttons: mission   4-7: engineer builds   Right-click: target".into());
     lines.push("Hover a fighter for details".into());
     lines.push("WASD/arrows/middle-drag: pan   Wheel: zoom".into());
-    lines.push("Space: pause   F: debug view (no fog + AI thoughts)   N: new map".into());
+    lines.push("Space: pause   F: debug view (no fog + AI thoughts)   N: new map   Esc: armory".into());
 
     // Debug view: what the enemy commander is thinking.
     if fog_debug.show_all
@@ -270,7 +270,7 @@ fn update_tooltip(
         if let (Some(f), Some(eq)) = (fighter, equipment) {
             let dmg = weapon_damage_type(f.class, eq.loadout);
             let secret = if eq.known_to[local.0.opponent().index()] { "  (enemy knows)" } else { "  (secret)" };
-            lines.push(format!("Loadout: {}{}", eq.loadout.name(), secret));
+            lines.push(format!("Loadout: {}{}   Upgrade: {}", eq.loadout.name(), secret, eq.modifier.name()));
             lines.push(format!("Weapon: {}   Armor: {}", dmg.name(), f.class.stats().armor_class.name()));
         }
         if let Some(v) = vet {

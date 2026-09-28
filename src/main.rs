@@ -17,6 +17,7 @@ mod game;
 mod hud;
 mod input;
 mod map;
+mod menu;
 mod pathfinding;
 mod sim;
 mod termbot;
@@ -48,6 +49,7 @@ fn main() {
             units::UnitVisualsPlugin,
             termbot::TermbotPlugin,
             army_panel::ArmyPanelPlugin,
+            menu::MenuPlugin,
         ))
         .add_systems(
             Update,

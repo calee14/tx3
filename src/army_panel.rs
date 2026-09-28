@@ -20,19 +20,11 @@ use crate::sim::economy::{
 };
 use crate::sim::fighter::Fighter;
 use crate::sim::platoon::MAX_PLATOON_SIZE;
-use crate::sim::gadgets::{AIR_STRIKE_COST, AirSupport, GadgetKind};
+use crate::sim::armory::{Armories, Machine};
+use crate::sim::gadgets::{AirSupport, GadgetKind, air_strike_cost};
 use crate::sim::vehicle::Vehicle;
 use crate::sim::{CommandQueue, SIM_HZ, SimCommand, SimTick};
 
-/// One line on what a gadget does.
-pub fn gadget_blurb(kind: GadgetKind) -> &'static str {
-    match kind {
-        GadgetKind::Mine => "Explodes under the first enemy to step on it.",
-        GadgetKind::Bomb => "Big blast when enemies come within 2 tiles.",
-        GadgetKind::Turret => "Automatic gun (range 11). Tough and never scared.",
-        GadgetKind::Artillery => "Shells enemy groups your side can see (range 50).",
-    }
-}
 
 pub struct ArmyPanelPlugin;
 
@@ -175,6 +167,8 @@ fn spawn_panel(mut commands: Commands) {
 fn panel_buttons(
     local: Res<LocalPlayer>,
     phase: Res<MatchPhase>,
+    armories: Res<Armories>,
+    supply: Res<Supply>,
     mut builder: ResMut<ArmyBuilder>,
     mut queue: ResMut<CommandQueue>,
     buttons: Query<(&Interaction, &PanelButton), Changed<Interaction>>,
@@ -207,7 +201,7 @@ fn panel_buttons(
             }
             PanelButton::Transport => builder.vehicle = !builder.vehicle,
             PanelButton::DefaultArmy if !phase.battle => {
-                for c in default_army_commands(local.0) {
+                for c in default_army_commands(local.0, armories.of(local.0), supply.of(local.0)) {
                     queue.push(c);
                 }
             }
@@ -229,6 +223,7 @@ fn update_panel(
     tick: Res<SimTick>,
     air: Res<AirSupport>,
     builder: Res<ArmyBuilder>,
+    armories: Res<Armories>,
     fighters: Query<(&Faction, &Fighter)>,
     vehicles: Query<(&Faction, &Vehicle)>,
     mut text: Single<&mut Text, (With<PanelText>, Without<ButtonLabel>, Without<PanelHeader>)>,
@@ -239,7 +234,10 @@ fn update_panel(
     let me = local.0;
     let counts = count_classes(me, fighters.iter(), vehicles.iter());
     let vehicle = phase.battle && builder.vehicle;
-    let cost = platoon_cost(&builder.classes, &counts, vehicle);
+    let armory = armories.of(me);
+    let cost = platoon_cost(&builder.classes, &counts, vehicle, armory);
+    let air_variant = armory.variant(Machine::AirStrike);
+    let air_cost = air_strike_cost(air_variant.unwrap_or(false));
     let have = supply.of(me);
 
     header.0 = if phase.battle {
@@ -252,13 +250,19 @@ fn update_panel(
 
     let mut lines = Vec::new();
     if let Some(kind) = builder.gadget {
-        let s = kind.stats();
-        lines.push(format!("Placing: {} ({:.0})", s.name, s.cost));
-        lines.push(gadget_blurb(kind).to_string());
+        let machine = Machine::of_gadget(kind);
+        let alt = armory.gadget_variant(kind).unwrap_or(false);
+        lines.push(format!("Placing: {} ({:.0})", machine.variant_name(alt), machine.price(alt)));
+        lines.push(machine.variant_blurb(alt).to_string());
         lines.push("Click inside your half. Hidden from the enemy until found.\nRight-click cancels.".into());
     } else if builder.air_strike {
-        lines.push(format!("Air strike ({AIR_STRIKE_COST:.0}): click an explored tile.").to_string());
-        lines.push("5 bombs in a line through it, along the line from your\nKing. 4 s warning (the enemy may see it coming).".into());
+        let alt = air_variant.unwrap_or(false);
+        lines.push(format!("{} ({air_cost:.0}): click an explored tile.", Machine::AirStrike.variant_name(alt)));
+        lines.push(if alt {
+            "One big bomb on it, 3 s warning (the enemy may see\nit coming).".into()
+        } else {
+            "5 bombs in a line through it, along the line from your\nKing. 4 s warning (the enemy may see it coming).".into()
+        });
     } else if builder.is_empty() {
         lines.push(format!("New platoon: add 1-{MAX_PLATOON_SIZE} fighters"));
     } else {
@@ -293,7 +297,12 @@ fn update_panel(
     }
 
     for (kind, interaction, mut bg, mut node, children) in &mut buttons {
-        let hidden = (kind.setup_only() && phase.battle) || (kind.battle_only() && !phase.battle);
+        let not_brought = match *kind {
+            PanelButton::Gadget(g) => armory.gadget_variant(g).is_none(),
+            PanelButton::AirStrike => air_variant.is_none(),
+            _ => false,
+        };
+        let hidden = (kind.setup_only() && phase.battle) || (kind.battle_only() && !phase.battle) || not_brought;
         node.display = if hidden { Display::None } else { Display::Flex };
         let active = (*kind == PanelButton::Transport && builder.vehicle)
             || matches!(*kind, PanelButton::Gadget(g) if builder.gadget == Some(g))
@@ -305,7 +314,7 @@ fn update_panel(
         };
         let label = match *kind {
             PanelButton::Add(class) => {
-                format!("+ {} {:.0}", class.stats().name, fighter_cost(class, &with_builder))
+                format!("+ {} {:.0}", class.stats().name, fighter_cost(class, &with_builder) + armory.surcharge(class))
             }
             PanelButton::RemoveLast => "Remove last".into(),
             PanelButton::Clear => "Clear".into(),
@@ -316,15 +325,20 @@ fn update_panel(
                     "Transport: On foot".into()
                 }
             }
-            PanelButton::Gadget(g) => format!("{} {:.0}", g.stats().name, g.stats().cost),
+            PanelButton::Gadget(g) => {
+                let alt = armory.gadget_variant(g).unwrap_or(false);
+                let m = Machine::of_gadget(g);
+                format!("{} {:.0}", m.variant_name(alt), m.price(alt))
+            }
             PanelButton::AirStrike => {
                 let wait = air.ready_tick[me.index()].saturating_sub(tick.0).div_ceil(SIM_HZ as u64);
+                let name = Machine::AirStrike.variant_name(air_variant.unwrap_or(false));
                 if wait > 0 {
-                    format!("Air strike {AIR_STRIKE_COST:.0}  (ready in {wait} s)")
-                } else if have < AIR_STRIKE_COST {
-                    format!("Air strike {AIR_STRIKE_COST:.0}  (not enough Supply)")
+                    format!("{name} {air_cost:.0}  (ready in {wait} s)")
+                } else if have < air_cost {
+                    format!("{name} {air_cost:.0}  (not enough Supply)")
                 } else {
-                    format!("Air strike {AIR_STRIKE_COST:.0}")
+                    format!("{name} {air_cost:.0}")
                 }
             }
             PanelButton::DefaultArmy => "Place default army".into(),

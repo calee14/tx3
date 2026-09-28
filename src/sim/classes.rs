@@ -89,8 +89,8 @@ pub fn suppression_multiplier(damage: DamageType) -> f32 {
     }
 }
 
-/// A fighter's hidden equipment, rolled when it's bought. The enemy only
-/// learns it when it's used.
+/// A fighter's hidden equipment, chosen per class in the armory before
+/// the match. The enemy only learns it when it's used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Loadout {
     /// Assaulter: nothing special.
@@ -168,6 +168,8 @@ pub fn weapon_damage_type(class: FighterClass, loadout: Loadout) -> DamageType {
 #[derive(bevy::prelude::Component, Clone, Copy, Debug)]
 pub struct Equipment {
     pub loadout: Loadout,
+    /// The class upgrade from the armory (hidden from the enemy).
+    pub modifier: super::armory::Modifier,
     /// Per faction index: has that side seen it used?
     pub known_to: [bool; 2],
     /// Seconds until the special ability can be used again.
@@ -177,14 +179,14 @@ pub struct Equipment {
 }
 
 impl Equipment {
-    pub fn new(loadout: Loadout, owner_index: usize) -> Self {
+    pub fn new(loadout: Loadout, modifier: super::armory::Modifier, owner_index: usize) -> Self {
         let mut known_to = [false; 2];
         known_to[owner_index] = true;
         let charges = match loadout {
             Loadout::Medkit | Loadout::MineLayer => 2,
             _ => 0,
         };
-        Self { loadout, known_to, cooldown: 0.0, charges }
+        Self { loadout, modifier, known_to, cooldown: 0.0, charges }
     }
 }
 
@@ -228,6 +230,17 @@ pub struct ClassStats {
 }
 
 impl FighterClass {
+    /// Position in `ALL`.
+    pub fn index(self) -> usize {
+        match self {
+            FighterClass::Assaulter => 0,
+            FighterClass::Sniper => 1,
+            FighterClass::HeavyWeapons => 2,
+            FighterClass::Juggernaut => 3,
+            FighterClass::Engineer => 4,
+        }
+    }
+
     pub const ALL: [FighterClass; 5] = [
         FighterClass::Assaulter,
         FighterClass::Sniper,

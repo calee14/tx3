@@ -9,7 +9,8 @@ use rand::Rng;
 use crate::faction::Faction;
 use crate::map::{CoverLevel, GameMap, MAP_H, MAP_W, TilePos};
 use crate::sim::classes::FighterClass::{self, *};
-use crate::sim::economy::{ClassCounts, STARTING_SUPPLY, platoon_cost};
+use crate::sim::economy::{ClassCounts, STARTING_SUPPLY, fit_army, platoon_cost};
+use crate::sim::armory::{Armory, Machine, Modifier};
 use crate::sim::gadgets::GadgetKind;
 use crate::sim::platoon::nearest_free_tile_where;
 
@@ -53,6 +54,26 @@ impl Style {
             Style::Balanced => 150.0,
             Style::Defensive => 250.0,
         }
+    }
+
+    /// What it brings to the match: machine weaponry to suit its style
+    /// (sometimes the second variant), random loadouts (so you can't be
+    /// sure what its fighters carry), and a couple of class upgrades.
+    pub fn armory(self, rng: &mut impl Rng) -> Armory {
+        use FighterClass as C;
+        let (machines, favored): (Vec<Machine>, Vec<(C, Modifier)>) = match self {
+            Style::Aggressive => (
+                vec![Machine::Mine, Machine::Bomb, Machine::AirStrike],
+                vec![(C::Assaulter, Modifier::LightKit), (C::Juggernaut, Modifier::BodyArmor)],
+            ),
+            Style::Balanced => (vec![Machine::Mine, Machine::Turret, Machine::AirStrike], vec![(C::Sniper, Modifier::Marksman)]),
+            Style::Defensive => (
+                vec![Machine::Mine, Machine::Turret, Machine::Artillery],
+                vec![(C::HeavyWeapons, Modifier::BodyArmor), (C::Sniper, Modifier::Marksman)],
+            ),
+        };
+        let machines = machines.into_iter().map(|m| (m, rng.random_bool(0.3))).collect();
+        Armory::random(machines, &favored, rng)
     }
 
     /// How far behind the middle line it likes to set up (rows).
@@ -123,21 +144,29 @@ fn anchor_score(map: &GameMap, pos: TilePos, preferred_depth: f32, faction: Fact
 /// The hidden army: which platoons to buy with the starting Supply and
 /// where to put them. Spots are chosen for cover and high ground, spread
 /// across the front, and deep enough to start out of the enemy's view.
-pub fn plan_setup(map: &GameMap, faction: Faction, style: Style, rng: &mut impl Rng) -> Vec<(Vec<FighterClass>, TilePos)> {
+pub fn plan_setup(
+    map: &GameMap,
+    faction: Faction,
+    style: Style,
+    armory: &Armory,
+    rng: &mut impl Rng,
+) -> Vec<(Vec<FighterClass>, TilePos)> {
     let mut budget = STARTING_SUPPLY - style.gadget_budget();
     let mut counts = ClassCounts::default();
     let mut plan = Vec::new();
     let king = map.spawn(faction);
     let mut chosen: Vec<TilePos> = Vec::new();
 
-    for mut classes in style.army() {
-        while !classes.is_empty() && platoon_cost(&classes, &counts, false) > budget {
+    let army = fit_army(style.army(), budget, armory);
+
+    for mut classes in army {
+        while !classes.is_empty() && platoon_cost(&classes, &counts, false, armory) > budget {
             classes.pop();
         }
         if classes.is_empty() {
             continue;
         }
-        let cost = platoon_cost(&classes, &counts, false);
+        let cost = platoon_cost(&classes, &counts, false, armory);
 
         // Best spot on a coarse grid, with a little randomness so the
         // army isn't in the same places every match.
@@ -175,21 +204,46 @@ pub fn plan_gadgets(
     map: &GameMap,
     faction: Faction,
     style: Style,
+    armory: &Armory,
     anchors: &[TilePos],
     rng: &mut impl Rng,
 ) -> Vec<(GadgetKind, TilePos)> {
     use GadgetKind::*;
-    let kinds = match style {
-        Style::Aggressive => vec![Mine, Mine],
+    let wish = match style {
+        Style::Aggressive => {
+            if rng.random_bool(0.5) {
+                vec![Bomb, Mine]
+            } else {
+                vec![Mine, Mine]
+            }
+        }
         Style::Balanced => {
             if rng.random_bool(0.5) {
                 vec![Turret]
             } else {
-                vec![Bomb, Mine]
+                vec![Mine, Mine, Mine]
             }
         }
-        Style::Defensive => vec![Turret, Mine, Mine],
+        Style::Defensive => {
+            if rng.random_bool(0.5) {
+                vec![Artillery]
+            } else {
+                vec![Turret, Mine, Mine]
+            }
+        }
     };
+    // Only what it brought, within its budget; left-over budget goes on mines.
+    let mut budget = style.gadget_budget();
+    let mut kinds = Vec::new();
+    for kind in wish.into_iter().chain([Mine, Mine, Mine]) {
+        if let Some(price) = armory.gadget_price(kind)
+            && price <= budget
+            && kinds.len() < 4
+        {
+            budget -= price;
+            kinds.push(kind);
+        }
+    }
     let king = map.spawn(faction);
     let enemy = map.spawn(faction.opponent());
     let mut chosen: Vec<TilePos> = Vec::new();
@@ -202,7 +256,7 @@ pub fn plan_gadgets(
             && anchors.iter().all(|a| a.distance(p) > 6.0)
     };
     for (i, kind) in kinds.into_iter().enumerate() {
-        let center = if kind == Turret {
+        let center = if matches!(kind, Turret | Artillery) {
             // In front of the King, toward the middle.
             let toward = Vec2::new(0.0, if faction == Faction::Humans { 1.0 } else { -1.0 });
             king.offset(0, (toward.y * 9.0) as i32)
@@ -324,7 +378,8 @@ mod tests {
             let map = generate_map(seed);
             let mut rng = ChaCha8Rng::seed_from_u64(seed);
             for style in [Style::Aggressive, Style::Balanced, Style::Defensive] {
-                let plan = plan_setup(&map, Faction::Termbots, style, &mut rng);
+                let armory = style.armory(&mut rng);
+                let plan = plan_setup(&map, Faction::Termbots, style, &armory, &mut rng);
                 assert!(plan.len() >= 3, "{style:?} placed {}", plan.len());
                 let mut counts = ClassCounts::default();
                 let mut spent = 0.0;
@@ -332,16 +387,16 @@ mod tests {
                     assert!(map.in_home_half(Faction::Termbots, *anchor));
                     assert!(depth(Faction::Termbots, *anchor) > ENEMY_PEEK_DEPTH, "starts hidden");
                     assert!((1..=5).contains(&classes.len()));
-                    spent += platoon_cost(classes, &counts, false);
+                    spent += platoon_cost(classes, &counts, false, &armory);
                     for &c in classes {
                         counts.add(c);
                     }
                 }
                 assert!(spent <= STARTING_SUPPLY - style.gadget_budget());
                 let anchors: Vec<TilePos> = plan.iter().map(|(_, a)| *a).collect();
-                let gadgets = plan_gadgets(&map, Faction::Termbots, style, &anchors, &mut rng);
+                let gadgets = plan_gadgets(&map, Faction::Termbots, style, &armory, &anchors, &mut rng);
                 assert!(!gadgets.is_empty());
-                let gadget_cost: f32 = gadgets.iter().map(|(k, _)| k.stats().cost).sum();
+                let gadget_cost: f32 = gadgets.iter().map(|(k, _)| armory.gadget_price(*k).unwrap()).sum();
                 assert!(gadget_cost <= style.gadget_budget(), "{style:?} gadgets cost {gadget_cost}");
                 for (_, p) in &gadgets {
                     assert!(map.in_home_half(Faction::Termbots, *p) && map.tile(*p).passable());
